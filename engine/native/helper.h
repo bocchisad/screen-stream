@@ -1,0 +1,38 @@
+#ifndef SCREEN_STREAM_HELPER_H
+#define SCREEN_STREAM_HELPER_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    int width;
+    int height;
+    int stride; /* bytes per row */
+} ss_frame_info;
+
+/* 0 = ok, 1 = permission, 2 = backend, 3 = other */
+int ss_mac_preflight(void);
+int ss_mac_request_permission(void);
+
+/* scale_percent: 100 = native pixels, 50 = half, 0 = native. max_w/max_h cap (0 = none). */
+int ss_mac_start(int display_index, int fps);
+int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, int max_h);
+int ss_mac_stop(void);
+int ss_mac_display_pixels(int display_index, int *out_w, int *out_h);
+
+/*
+ * Copies latest BGRA frame into dst (dst_len bytes).
+ * Returns 0 on success, fills info. Non-blocking: returns 4 if no new frame.
+ */
+int ss_mac_capture(uint8_t *dst, int dst_len, ss_frame_info *info);
+
+int ss_mac_set_exclude_bundle(const char *bundle_id);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

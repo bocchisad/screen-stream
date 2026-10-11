@@ -1,0 +1,34 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+/screen-stream
+cmd/screen-stream/screen-stream
+
+# Test / coverage
+*.test
+*.out
+coverage.*
+*.prof
+
+# Go workspace local (keep go.work in repo for this multi-module layout)
+# go.work.sum is committed
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Snapshots / local artifacts
+*.png
+*.jpg
+*.jpeg
+/tmp/
+*.log
+.env
+.env.*
