@@ -100,10 +100,28 @@ func runHub(addr string) {
 		fmt.Fprintf(os.Stderr, "hub: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("signaling hub on %s\n", url)
-	fmt.Println("peer A: go run ./cmd/screen-stream -mode=send -signal=" + addr + " -synthetic=false")
-	fmt.Println("peer B: go run ./cmd/screen-stream -mode=recv -signal=" + addr + " -snapshot=/tmp/recv.png")
+	clientAddr := "127.0.0.1:8787"
+	if host, port, err := splitHostPort(addr); err == nil {
+		if host == "0.0.0.0" || host == "::" || host == "" {
+			clientAddr = "127.0.0.1:" + port
+		} else {
+			clientAddr = host + ":" + port
+		}
+	}
+	fmt.Printf("signaling hub listening on %s\n", url)
+	fmt.Println("keep this terminal open, then in TWO other terminals:")
+	fmt.Printf("  send: go run ./cmd/screen-stream -mode=send -signal=%s -synthetic=false -scale=75 -seconds=30\n", clientAddr)
+	fmt.Printf("  recv: go run ./cmd/screen-stream -mode=recv -signal=%s -seconds=30 -snapshot=/tmp/recv.png\n", clientAddr)
 	select {}
+}
+
+func splitHostPort(addr string) (host, port string, err error) {
+	for i := len(addr) - 1; i >= 0; i-- {
+		if addr[i] == ':' {
+			return addr[:i], addr[i+1:], nil
+		}
+	}
+	return "", "", fmt.Errorf("no port")
 }
 
 type sessionOpts struct {
@@ -171,6 +189,7 @@ func runSession(o sessionOpts) {
 		if err := rtc.DialOfferer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial offer: %v\n", err)
+			fmt.Fprintf(os.Stderr, "hint: start hub first and keep it running:\n  go run ./cmd/screen-stream -mode=hub -signal=0.0.0.0:8787\n")
 			os.Exit(1)
 		}
 		dialCancel()
@@ -196,6 +215,7 @@ func runSession(o sessionOpts) {
 		if err := rtc.DialAnswerer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial answer: %v\n", err)
+			fmt.Fprintf(os.Stderr, "hint: start hub first and keep it running:\n  go run ./cmd/screen-stream -mode=hub -signal=0.0.0.0:8787\n")
 			os.Exit(1)
 		}
 		dialCancel()

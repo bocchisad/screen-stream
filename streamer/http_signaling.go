@@ -45,9 +45,18 @@ func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 	mux.HandleFunc("/offer", h.handleOffer)
 	mux.HandleFunc("/answer", h.handleAnswer)
 	mux.HandleFunc("/ice", h.handleICE)
-	ln, err := net.Listen("tcp", addr)
+	// Prefer tcp4 so clients dialing 127.0.0.1 work (tcp on macOS often binds [::] only).
+	network := "tcp4"
+	if len(addr) > 0 && addr[0] == '[' {
+		network = "tcp"
+	}
+	ln, err := net.Listen(network, addr)
 	if err != nil {
-		return "", err
+		// Fallback if tcp4 unavailable.
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
+			return "", err
+		}
 	}
 	h.addr = ln.Addr().String()
 	h.srv = &http.Server{Handler: mux}
