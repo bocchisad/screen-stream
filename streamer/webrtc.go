@@ -222,18 +222,22 @@ func (s *WebRTCSession) attachDC(dc *webrtc.DataChannel) {
 		if msg.IsString {
 			return
 		}
+		// ChunkReassembler copies into pooled buffers before returning;
+		// Push must finish before this callback returns (pion may recycle Data).
 		s.reasm.Push(msg.Data)
 	})
 }
 
 func (s *WebRTCSession) waitDC(ctx context.Context) error {
+	timer := time.NewTimer(45 * time.Second)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("datachannel wait canceled: %w (is the other peer running? hub+/send+/recv)", ctx.Err())
 	case <-s.dcOpen:
 		return nil
-	case <-time.After(20 * time.Second):
-		return fmt.Errorf("datachannel open timeout")
+	case <-timer.C:
+		return fmt.Errorf("datachannel open timeout (start hub, then send + recv together; restart hub if stale)")
 	}
 }
 

@@ -42,6 +42,7 @@ func NewHTTPSignalingHub() *HTTPSignalingHub {
 func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
+	mux.HandleFunc("/status", h.handleStatus)
 	mux.HandleFunc("/offer", h.handleOffer)
 	mux.HandleFunc("/answer", h.handleAnswer)
 	mux.HandleFunc("/ice", h.handleICE)
@@ -66,6 +67,19 @@ func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 
 func (h *HTTPSignalingHub) Addr() string { return h.addr }
 
+func (h *HTTPSignalingHub) handleStatus(w http.ResponseWriter, _ *http.Request) {
+	h.mu.Lock()
+	st := map[string]any{
+		"hasOffer":  h.offer != "",
+		"hasAnswer": h.answer != "",
+		"iceOffer":  len(h.iceOffer),
+		"iceAnswer": len(h.iceAnswer),
+	}
+	h.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(st)
+}
+
 func (h *HTTPSignalingHub) Close() error {
 	if h.srv == nil {
 		return nil
@@ -73,6 +87,13 @@ func (h *HTTPSignalingHub) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return h.srv.Shutdown(ctx)
+}
+
+func (h *HTTPSignalingHub) resetLocked() {
+	h.offer = ""
+	h.answer = ""
+	h.iceOffer = nil
+	h.iceAnswer = nil
 }
 
 func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +105,8 @@ func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.mu.Lock()
+		// New offer starts a fresh session (drops stale answer/ICE from prior runs).
+		h.resetLocked()
 		h.offer = b.SDP
 		h.cond.Broadcast()
 		h.mu.Unlock()
@@ -94,8 +117,16 @@ func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 			h.cond.Wait()
 		}
 		sdp := h.offer
+		// One-shot: consume offer so a late recv cannot bind to a dead sender.
+		h.offer = ""
 		h.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(sdpBody{SDP: sdp})
+	case http.MethodDelete:
+		h.mu.Lock()
+		h.resetLocked()
+		h.cond.Broadcast()
+		h.mu.Unlock()
+		w.WriteHeader(204)
 	default:
 		http.Error(w, "method", 405)
 	}
@@ -120,6 +151,7 @@ func (h *HTTPSignalingHub) handleAnswer(w http.ResponseWriter, r *http.Request) 
 			h.cond.Wait()
 		}
 		sdp := h.answer
+		h.answer = "" // one-shot
 		h.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(sdpBody{SDP: sdp})
 	default:

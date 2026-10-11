@@ -109,6 +109,16 @@ func (r *FrameReconstructor) ApplyUnpacked(u *Unpacked) error {
 	return nil
 }
 
+// WithCanvas calls fn with the live BGRA canvas (valid only during the call).
+func (r *FrameReconstructor) WithCanvas(fn func(bgra []byte, width, height, stride int)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.canvas) == 0 || fn == nil {
+		return
+	}
+	fn(r.canvas, r.width, r.height, r.stride)
+}
+
 // WritePNG saves the current canvas as a PNG (BGRA→RGBA).
 func (r *FrameReconstructor) WritePNG(path string) error {
 	r.mu.Lock()

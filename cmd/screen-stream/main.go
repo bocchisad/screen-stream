@@ -24,13 +24,14 @@ func main() {
 	height := flag.Int("height", 1080, "synthetic height")
 	block := flag.Int("block", 64, "diff block size")
 	synthetic := flag.Bool("synthetic", true, "synthetic frames (send/bench/loopback)")
-	pii := flag.Bool("pii", true, "enable PII pattern redaction")
-	ocr := flag.Bool("ocr", false, "use OCRDetector adapter (stub backend unless wired)")
+	pii := flag.Bool("pii", false, "enable PII pattern redaction (demo corner hit when no OCR)")
+	ocr := flag.Bool("ocr", false, "use OCRDetector (Vision on macOS)")
 	compress := flag.Bool("compress", true, "zlib payloads on WebRTC")
 	scale := flag.Int("scale", 100, "capture scale percent (100 = Retina pixels)")
 	maxW := flag.Int("max-width", 0, "cap capture width")
 	maxH := flag.Int("max-height", 0, "cap capture height")
 	snapshot := flag.String("snapshot", "", "write reconstructed PNG (recv/loopback)")
+	preview := flag.String("preview", "", "MJPEG preview listen addr for recv/loopback (e.g. 127.0.0.1:8090)")
 	exclude := flag.String("exclude", "", "macOS bundle IDs to exclude")
 	xorSeedFlag := flag.String("xor-seed", "", "protect seed (decimal or 0xHEX); else env SCREEN_STREAM_XOR_SEED")
 	// legacy alias
@@ -71,7 +72,7 @@ func main() {
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
 			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
-			snapshot: *snapshot, transport: "loopback",
+			snapshot: *snapshot, preview: *preview, transport: "loopback",
 		})
 	case "send":
 		runSession(sessionOpts{
@@ -84,7 +85,7 @@ func main() {
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: true, // recv does not capture
-			compress: *compress, seed: seed, snapshot: *snapshot,
+			compress: *compress, seed: seed, snapshot: *snapshot, preview: *preview,
 			transport: "recv", signalURL: "http://" + *signalAddr,
 		})
 	default:
@@ -134,6 +135,7 @@ type sessionOpts struct {
 	exclude                 string
 	seed                    uint64
 	snapshot                string
+	preview                 string // MJPEG listen addr
 	transport               string // local | loopback | send | recv
 	signalURL               string
 }
@@ -160,6 +162,11 @@ func runSession(o sessionOpts) {
 
 	case "loopback":
 		rec = streamer.NewFrameReconstructor(o.seed)
+		prev := startPreview(o.preview)
+		if prev != nil {
+			defer prev.Close()
+		}
+		var lastPrev time.Time
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 45*time.Second)
 		var err error
 		rtc, rtcPeer, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
@@ -169,6 +176,7 @@ func runSession(o sessionOpts) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
 					reconFrames.Add(1)
+					maybePreview(prev, rec, &lastPrev)
 				}
 			},
 		})
@@ -189,7 +197,9 @@ func runSession(o sessionOpts) {
 		if err := rtc.DialOfferer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial offer: %v\n", err)
-			fmt.Fprintf(os.Stderr, "hint: start hub first and keep it running:\n  go run ./cmd/screen-stream -mode=hub -signal=0.0.0.0:8787\n")
+			fmt.Fprintf(os.Stderr, "hint: hub must be running, and recv should be started around the same time:\n")
+			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787\n")
+			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -preview=127.0.0.1:8090 -xor-seed=...\n")
 			os.Exit(1)
 		}
 		dialCancel()
@@ -200,6 +210,11 @@ func runSession(o sessionOpts) {
 
 	case "recv":
 		rec = streamer.NewFrameReconstructor(o.seed)
+		prev := startPreview(o.preview)
+		if prev != nil {
+			defer prev.Close()
+		}
+		var lastPrev time.Time
 		sig := streamer.NewHTTPSignalingClient(o.signalURL)
 		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{
 			RingDepth: 4,
@@ -208,6 +223,7 @@ func runSession(o sessionOpts) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
 					reconFrames.Add(1)
+					maybePreview(prev, rec, &lastPrev)
 				}
 			},
 		})
@@ -215,13 +231,16 @@ func runSession(o sessionOpts) {
 		if err := rtc.DialAnswerer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial answer: %v\n", err)
-			fmt.Fprintf(os.Stderr, "hint: start hub first and keep it running:\n  go run ./cmd/screen-stream -mode=hub -signal=0.0.0.0:8787\n")
+			fmt.Fprintf(os.Stderr, "hint: need THREE terminals, same xor-seed:\n")
+			fmt.Fprintf(os.Stderr, "  1) go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787\n")
+			fmt.Fprintf(os.Stderr, "  2) go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 -synthetic=false -seconds=30 -xor-seed=0xC0FFEE42D00D\n")
+			fmt.Fprintf(os.Stderr, "  3) go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -seconds=30 -preview=127.0.0.1:8090 -xor-seed=0xC0FFEE42D00D\n")
+			fmt.Fprintf(os.Stderr, "start send+recv while hub is up; if stuck, restart hub.\n")
 			os.Exit(1)
 		}
 		dialCancel()
 		defer rtc.Stop()
 		fmt.Printf("webrtc: recv ← %s\n", o.signalURL)
-		// recv-only: wait for duration, then snapshot
 		<-ctx.Done()
 		time.Sleep(200 * time.Millisecond)
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
@@ -284,9 +303,10 @@ func runSession(o sessionOpts) {
 
 	var detector engine.PIIDetector
 	if o.ocr {
-		detector = engine.NewOCRDetector(engine.StubOCRBackend{})
+		detector = engine.NewOCRDetector(engine.NewVisionOCRBackend())
 	} else if o.pii {
 		pd := engine.NewPatternDetector()
+		// Explicit demo mask only when -pii is on (top-left block).
 		pd.SetHits([]engine.Rect{{X: 0, Y: 0, W: uint16(o.block), H: uint16(o.block)}})
 		detector = pd
 	}
@@ -387,6 +407,34 @@ loop:
 	}
 	fmt.Printf("heap_mallocs=%d  (~%.2f/frame)  total_alloc_bytes=%d\n", mallocs, per, bytes)
 	fmt.Println(streamer.DescribeHandoff())
+}
+
+func startPreview(addr string) *streamer.PreviewServer {
+	if addr == "" {
+		return nil
+	}
+	p := streamer.NewPreviewServer(70)
+	url, err := p.ListenAndServe(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "preview: %v\n", err)
+		return nil
+	}
+	fmt.Printf("preview: %s  (open in browser)\n", url)
+	return p
+}
+
+func maybePreview(p *streamer.PreviewServer, rec *streamer.FrameReconstructor, last *time.Time) {
+	if p == nil || rec == nil {
+		return
+	}
+	now := time.Now()
+	if !last.IsZero() && now.Sub(*last) < 100*time.Millisecond {
+		return // ~10 FPS preview encode cap
+	}
+	*last = now
+	rec.WithCanvas(func(bgra []byte, w, h, stride int) {
+		_ = p.UpdateFromBGRA(bgra, w, h, stride)
+	})
 }
 
 func splitCSV(s string) []string {

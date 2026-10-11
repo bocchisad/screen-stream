@@ -1,13 +1,15 @@
 package engine
 
-import "context"
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+)
 
-// OCRDetector is a pluggable on-device text detector adapter.
-// Wire a real OCR engine (e.g. Apple Vision / Tesseract) behind ScanFrame;
-// default is a no-op until SetBackend is called.
+// OCRBackend is a pluggable on-device text detector (Vision / Tesseract / stub).
 type OCRBackend interface {
 	// ScanFrame returns text lines with screen-space bounds for the given BGRA frame.
-	// May run off the hot path; results are consumed via PatternDetector.SetHits.
+	// May be slow; OCRDetector calls it off the capture hot path.
 	ScanFrame(ctx context.Context, meta FrameMeta, bgra []byte) ([]OCRLine, error)
 }
 
@@ -18,36 +20,73 @@ type OCRLine struct {
 }
 
 // OCRDetector implements PIIDetector by scanning OCR lines through PatternDetector rules.
+// ScanFrame runs asynchronously so Process stays on the hot path; Detect returns last hits.
 type OCRDetector struct {
 	Patterns *PatternDetector
 	Backend  OCRBackend
-	hits     []Rect
+	Every    uint64 // kick a scan every N frames (default 15)
+
+	hits   []Rect
+	frameN atomic.Uint64
+	busy   atomic.Bool
+
+	mu      sync.Mutex
+	scratch []byte
 }
 
 func NewOCRDetector(backend OCRBackend) *OCRDetector {
 	return &OCRDetector{
 		Patterns: NewPatternDetector(),
 		Backend:  backend,
+		Every:    15,
 		hits:     make([]Rect, 0, 32),
 	}
 }
 
-func (d *OCRDetector) Detect(ctx context.Context, meta FrameMeta, protectedBGRA []byte) ([]Rect, error) {
+func (d *OCRDetector) Detect(ctx context.Context, meta FrameMeta, plaintextBGRA []byte) ([]Rect, error) {
 	if d.Backend == nil {
 		return d.Patterns.DetectInto(nil), nil
 	}
-	// Caller typically feeds plaintext scratch; protected buffer is not decoded here.
-	_ = protectedBGRA
-	lines, err := d.Backend.ScanFrame(ctx, meta, nil)
-	if err != nil {
-		return nil, err
+	every := d.Every
+	if every == 0 {
+		every = 15
 	}
-	d.hits = d.hits[:0]
-	for _, ln := range lines {
-		d.hits = append(d.hits, d.Patterns.ScanText(ln.Text, ln.Rect, meta.BlockSize)...)
+	n := d.frameN.Add(1)
+	if (n == 1 || n%every == 0) && d.busy.CompareAndSwap(false, true) {
+		d.kickAsync(ctx, meta, plaintextBGRA)
 	}
-	d.Patterns.SetHits(d.hits)
 	return d.Patterns.DetectInto(nil), nil
+}
+
+func (d *OCRDetector) kickAsync(ctx context.Context, meta FrameMeta, bgra []byte) {
+	need := len(bgra)
+	d.mu.Lock()
+	if cap(d.scratch) < need {
+		d.scratch = make([]byte, need)
+	}
+	copy(d.scratch[:need], bgra)
+	snap := d.scratch[:need]
+	metaCopy := meta
+	d.mu.Unlock()
+
+	go func() {
+		defer d.busy.Store(false)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		lines, err := d.Backend.ScanFrame(ctx, metaCopy, snap)
+		if err != nil {
+			return
+		}
+		hits := d.hits[:0]
+		for _, ln := range lines {
+			hits = append(hits, d.Patterns.ScanText(ln.Text, ln.Rect, metaCopy.BlockSize)...)
+		}
+		d.hits = hits
+		d.Patterns.SetHits(hits)
+	}()
 }
 
 // StubOCRBackend returns no lines (keeps interface wired for integration tests).

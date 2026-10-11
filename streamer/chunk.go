@@ -71,10 +71,23 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	defer r.mu.Unlock()
 	pm, ok := r.pending[msgID]
 	if !ok {
+		buf := r.allocBuf(total)
 		pm = &partialMsg{
 			total:  total,
 			count:  count,
-			buf:    make([]byte, total),
+			buf:    buf,
+			filled: make([]bool, count),
+		}
+		r.pending[msgID] = pm
+	} else if pm.total != total || pm.count != count {
+		// Conflicting fragment metadata — drop and restart.
+		r.releaseBuf(pm.buf)
+		delete(r.pending, msgID)
+		buf := r.allocBuf(total)
+		pm = &partialMsg{
+			total:  total,
+			count:  count,
+			buf:    buf,
 			filled: make([]bool, count),
 		}
 		r.pending[msgID] = pm
@@ -102,6 +115,26 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	if r.onFull != nil {
 		r.onFull(full)
 	}
+	// Return backing store to pool after consumer returns (onFull must not retain).
+	r.releaseBuf(full)
+}
+
+func (r *ChunkReassembler) allocBuf(total int) []byte {
+	if bp, ok := r.pool.Get().(*[]byte); ok {
+		if cap(*bp) >= total {
+			return (*bp)[:total]
+		}
+		r.pool.Put(bp)
+	}
+	return make([]byte, total)
+}
+
+func (r *ChunkReassembler) releaseBuf(buf []byte) {
+	if buf == nil {
+		return
+	}
+	b := buf[:0]
+	r.pool.Put(&b)
 }
 
 // SplitWire fragments a packed DirtyPacket into SSCH chunks.

@@ -134,8 +134,9 @@ type Pipeline interface {
 }
 
 // PIIDetector returns screen-space rects to redact before send.
+// Pipeline passes plaintext BGRA scratch (not XOR-protected).
 type PIIDetector interface {
-	Detect(ctx context.Context, meta FrameMeta, protectedBGRA []byte) ([]Rect, error)
+	Detect(ctx context.Context, meta FrameMeta, plaintextBGRA []byte) ([]Rect, error)
 }
 
 // PermissionError wraps ErrPermissionDenied with OS-specific guidance.

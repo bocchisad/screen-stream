@@ -10,7 +10,7 @@ Privacy-preserving, low-latency screen capture + P2P DirtyPacket delivery (Go + 
 | `loopback` | In-process WebRTC offer↔answer + reconstruct (`-webrtc` alias) |
 | `hub` | Local HTTP signaling (no cloud) |
 | `send` | Capture → WebRTC offerer → hub |
-| `recv` | WebRTC answerer ← hub → reconstruct / PNG |
+| `recv` | WebRTC answerer ← hub → reconstruct / PNG / MJPEG preview |
 
 ## Quick start
 
@@ -21,22 +21,31 @@ go test ./engine/ ./streamer/ -count=1
 # Local bench / Retina live
 go run ./cmd/screen-stream -mode=bench -synthetic=false -scale=100 -seconds=3
 
-# Loopback P2P + snapshot
+# Loopback P2P + snapshot + live preview
 go run ./cmd/screen-stream -mode=loopback -synthetic=false -scale=100 \
-  -seconds=3 -snapshot=/tmp/ss.png
+  -seconds=10 -snapshot=/tmp/ss.png -preview=127.0.0.1:8090
+# open http://127.0.0.1:8090/
 
-# Two-process P2P (same machine or LAN)
+# Three terminals — hub must stay up; start recv then send (or both together)
 # terminal 1:
-go run ./cmd/screen-stream -mode=hub -signal=0.0.0.0:8787
-# terminal 2 (sender):
-go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
-  -synthetic=false -scale=75 -seconds=10 -xor-seed=0xC0FFEE42D00D
-# terminal 3 (receiver):
+go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787
+# terminal 2 (receiver + preview) — start first so it waits for offer:
 go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 \
-  -seconds=10 -snapshot=/tmp/recv.png -xor-seed=0xC0FFEE42D00D
+  -seconds=30 -snapshot=/tmp/recv.png -preview=127.0.0.1:8090 \
+  -xor-seed=0xC0FFEE42D00D
+# terminal 3 (sender):
+go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
+  -synthetic=false -scale=75 -seconds=30 -xor-seed=0xC0FFEE42D00D
+# open http://127.0.0.1:8090/  — gray bar = waiting; picture = stream OK
+# if dial times out: restart hub (clears stale SDP), then recv+send again
 ```
 
 Shared XOR seed: `-xor-seed` or env `SCREEN_STREAM_XOR_SEED`.
+
+Useful flags:
+- `-pii` — demo corner blackout (off by default)
+- `-ocr` — on-device Vision OCR → pattern redaction (macOS)
+- `-preview=host:port` — MJPEG viewer on recv/loopback
 
 Exit `2` = screen permission denied.
 
@@ -50,16 +59,16 @@ Exit `2` = screen permission denied.
 | Wayland PipeWire | State-machine skeleton; full portal needs `-DSS_HAVE_PIPEWIRE=1` |
 | Frame diff + dirty boxes | Done (C via cgo, pure Go fallback) |
 | RAM XOR protect | Done (C via cgo) |
-| PII masking | PatternDetector + OCRDetector adapter (stub OCR backend) |
-| WebRTC DataChannel | Done (chunked + zlib) |
+| PII masking | PatternDetector + OCRDetector; Vision backend on macOS (`-ocr`) |
+| WebRTC DataChannel | Done (chunked SSCH + zlib + buffer pool) |
 | P2P without cloud SFU | Done (local hub signaling) |
-| Viewer UI | Snapshot PNG only |
+| Viewer UI | MJPEG `-preview` + PNG `-snapshot` |
 | GPU / video encode | Not in v0 |
 
 ## Layout
 
 ```
-engine/     grabber_*, pipeline, protect_{cgo,pure}, pii, pool, native/
-streamer/   webrtc, chunk, compress, proto, receiver, http_signaling
+engine/     grabber_*, pipeline, protect_{cgo,pure}, pii, ocr_vision_*, pool, native/
+streamer/   webrtc, chunk, compress, proto, receiver, preview, http_signaling
 cmd/screen-stream/
 ```

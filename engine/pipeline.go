@@ -111,7 +111,8 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 				fillBlack(p.plain, stride, int(r.X), int(r.Y), int(r.W), int(r.H))
 			}
 		} else {
-			rects, err := p.detector.Detect(ctx, meta, frame.Pixels[:need])
+			// Pass plaintext scratch so OCR / scanners can read pixels.
+			rects, err := p.detector.Detect(ctx, meta, p.plain[:need])
 			if err == nil {
 				for _, r := range rects {
 					fillBlack(p.plain, stride, int(r.X), int(r.Y), int(r.W), int(r.H))
