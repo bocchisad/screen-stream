@@ -1,7 +1,8 @@
+//go:build !cgo
+
 package engine
 
-// Portable implementations (always in the package so gopls cross-GOOS analysis works).
-// On cgo builds these are still used; native C in protect.c remains available for future hot paths.
+// Pure-Go protect/diff (used when CGO_ENABLED=0 / gopls cross-analysis).
 
 func xorBuffer(buf []byte, key *uint64) {
 	k := *key

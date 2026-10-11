@@ -104,17 +104,20 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	}
 }
 
-// SplitWire fragments a packed DirtyPacket into SSCH chunks (reuses out slice headers).
-func SplitWire(msgID uint32, wire []byte, chunkSize int, emit func([]byte) error) error {
+// SplitWire fragments a packed DirtyPacket into SSCH chunks.
+// scratch must be at least ChunkHeaderSize+chunkSize; reused across emits (emit must copy/send before return).
+func SplitWire(msgID uint32, wire []byte, chunkSize int, scratch []byte, emit func([]byte) error) error {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
 	}
-	if len(wire) <= chunkSize {
-		// Still wrap as single chunk for uniform receiver path when forceChunk.
-		return emitOneChunk(msgID, 0, 1, wire, wire, emit)
+	need := ChunkHeaderSize + chunkSize
+	if cap(scratch) < need {
+		scratch = make([]byte, need)
 	}
-	count := (len(wire) + chunkSize - 1) / chunkSize
-	hdr := make([]byte, ChunkHeaderSize+chunkSize)
+	count := 1
+	if len(wire) > chunkSize {
+		count = (len(wire) + chunkSize - 1) / chunkSize
+	}
 	for i := 0; i < count; i++ {
 		start := i * chunkSize
 		end := start + chunkSize
@@ -123,7 +126,7 @@ func SplitWire(msgID uint32, wire []byte, chunkSize int, emit func([]byte) error
 		}
 		part := wire[start:end]
 		n := ChunkHeaderSize + len(part)
-		buf := hdr[:n]
+		buf := scratch[:n]
 		binary.LittleEndian.PutUint32(buf[0:], ChunkMagic)
 		binary.LittleEndian.PutUint32(buf[4:], msgID)
 		binary.LittleEndian.PutUint16(buf[8:], uint16(i))
@@ -135,17 +138,6 @@ func SplitWire(msgID uint32, wire []byte, chunkSize int, emit func([]byte) error
 		}
 	}
 	return nil
-}
-
-func emitOneChunk(msgID uint32, index, count int, wire, part []byte, emit func([]byte) error) error {
-	buf := make([]byte, ChunkHeaderSize+len(part))
-	binary.LittleEndian.PutUint32(buf[0:], ChunkMagic)
-	binary.LittleEndian.PutUint32(buf[4:], msgID)
-	binary.LittleEndian.PutUint16(buf[8:], uint16(index))
-	binary.LittleEndian.PutUint16(buf[10:], uint16(count))
-	binary.LittleEndian.PutUint32(buf[12:], uint32(len(wire)))
-	copy(buf[ChunkHeaderSize:], part)
-	return emit(buf)
 }
 
 var msgIDCounter atomic.Uint32

@@ -16,45 +16,223 @@ import (
 )
 
 func main() {
-	seconds := flag.Float64("seconds", 3, "benchmark duration")
+	mode := flag.String("mode", "bench", "bench | hub | send | recv | loopback")
+	signalAddr := flag.String("signal", "127.0.0.1:8787", "signaling listen/dial host:port")
+	seconds := flag.Float64("seconds", 3, "run duration (bench/send/recv/loopback)")
 	fps := flag.Int("fps", 60, "target FPS")
-	width := flag.Int("width", 1920, "synthetic width (default FHD)")
-	height := flag.Int("height", 1080, "synthetic height (default FHD)")
+	width := flag.Int("width", 1920, "synthetic width")
+	height := flag.Int("height", 1080, "synthetic height")
 	block := flag.Int("block", 64, "diff block size")
-	synthetic := flag.Bool("synthetic", true, "use synthetic frames (no OS capture)")
-	pii := flag.Bool("pii", true, "enable pattern redaction detector")
-	useWebRTC := flag.Bool("webrtc", false, "pion DataChannel loopback + reconstruct")
-	compress := flag.Bool("compress", true, "zlib-compress DirtyPacket payloads on WebRTC")
-	scale := flag.Int("scale", 100, "capture scale percent (100 = native Retina pixels)")
-	maxW := flag.Int("max-width", 0, "cap capture width (0 = unlimited)")
-	maxH := flag.Int("max-height", 0, "cap capture height (0 = unlimited)")
-	snapshot := flag.String("snapshot", "", "write reconstructed PNG (webrtc mode)")
-	exclude := flag.String("exclude", "", "comma-separated bundle IDs to exclude (macOS)")
+	synthetic := flag.Bool("synthetic", true, "synthetic frames (send/bench/loopback)")
+	pii := flag.Bool("pii", true, "enable PII pattern redaction")
+	ocr := flag.Bool("ocr", false, "use OCRDetector adapter (stub backend unless wired)")
+	compress := flag.Bool("compress", true, "zlib payloads on WebRTC")
+	scale := flag.Int("scale", 100, "capture scale percent (100 = Retina pixels)")
+	maxW := flag.Int("max-width", 0, "cap capture width")
+	maxH := flag.Int("max-height", 0, "cap capture height")
+	snapshot := flag.String("snapshot", "", "write reconstructed PNG (recv/loopback)")
+	exclude := flag.String("exclude", "", "macOS bundle IDs to exclude")
+	xorSeedFlag := flag.String("xor-seed", "", "protect seed (decimal or 0xHEX); else env SCREEN_STREAM_XOR_SEED")
+	// legacy alias
+	webrtcAlias := flag.Bool("webrtc", false, "alias for -mode=loopback")
 	flag.Parse()
 
-	fmt.Printf("screen-stream  go=%s  os=%s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	if *webrtcAlias && *mode == "bench" {
+		*mode = "loopback"
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*seconds*float64(time.Second)))
+	seed := engine.DefaultXORSeed
+	if *xorSeedFlag != "" {
+		n, err := engine.ParseXORSeed(*xorSeedFlag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		seed = n
+	} else {
+		seed = engine.ResolveXORSeed(0)
+	}
+
+	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  xor_seed=0x%X\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, seed)
+
+	switch *mode {
+	case "hub":
+		runHub(*signalAddr)
+	case "bench":
+		runSession(sessionOpts{
+			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
+			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
+			transport: "local",
+		})
+	case "loopback":
+		runSession(sessionOpts{
+			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
+			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
+			snapshot: *snapshot, transport: "loopback",
+		})
+	case "send":
+		runSession(sessionOpts{
+			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
+			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
+			transport: "send", signalURL: "http://" + *signalAddr,
+		})
+	case "recv":
+		runSession(sessionOpts{
+			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
+			synthetic: true, // recv does not capture
+			compress: *compress, seed: seed, snapshot: *snapshot,
+			transport: "recv", signalURL: "http://" + *signalAddr,
+		})
+	default:
+		fmt.Fprintf(os.Stderr, "unknown -mode %q\n", *mode)
+		os.Exit(1)
+	}
+}
+
+func runHub(addr string) {
+	hub := streamer.NewHTTPSignalingHub()
+	url, err := hub.ListenAndServe(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hub: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("signaling hub on %s\n", url)
+	fmt.Println("peer A: go run ./cmd/screen-stream -mode=send -signal=" + addr + " -synthetic=false")
+	fmt.Println("peer B: go run ./cmd/screen-stream -mode=recv -signal=" + addr + " -snapshot=/tmp/recv.png")
+	select {}
+}
+
+type sessionOpts struct {
+	seconds                 float64
+	fps, width, height      int
+	block                   int
+	synthetic, pii, ocr     bool
+	compress                bool
+	scale, maxW, maxH       int
+	exclude                 string
+	seed                    uint64
+	snapshot                string
+	transport               string // local | loopback | send | recv
+	signalURL               string
+}
+
+func runSession(o sessionOpts) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(o.seconds*float64(time.Second)))
 	defer cancel()
 
+	var (
+		sink        streamer.Sink
+		recvCount   atomic.Uint64
+		reconFrames atomic.Uint64
+		rec         *streamer.FrameReconstructor
+		rtc         *streamer.WebRTCSession
+		rtcPeer     *streamer.WebRTCSession
+	)
+
+	switch o.transport {
+	case "local":
+		local := streamer.NewLocalSink(4, nil)
+		_ = local.Start(ctx)
+		defer local.Stop()
+		sink = local
+
+	case "loopback":
+		rec = streamer.NewFrameReconstructor(o.seed)
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 45*time.Second)
+		var err error
+		rtc, rtcPeer, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
+			RingDepth: 4,
+			Compress:  o.compress,
+			OnPacket: func(b []byte) {
+				recvCount.Add(1)
+				if err := rec.Apply(b); err == nil {
+					reconFrames.Add(1)
+				}
+			},
+		})
+		dialCancel()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "webrtc loopback: %v\n", err)
+			os.Exit(1)
+		}
+		defer rtc.Stop()
+		defer rtcPeer.Stop()
+		sink = rtc
+		fmt.Printf("webrtc: loopback (compress=%v)\n", o.compress)
+
+	case "send":
+		sig := streamer.NewHTTPSignalingClient(o.signalURL)
+		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{RingDepth: 4, Compress: o.compress})
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := rtc.DialOfferer(dialCtx, sig); err != nil {
+			dialCancel()
+			fmt.Fprintf(os.Stderr, "dial offer: %v\n", err)
+			os.Exit(1)
+		}
+		dialCancel()
+		_ = rtc.StartSendLoop(context.Background())
+		defer rtc.Stop()
+		sink = rtc
+		fmt.Printf("webrtc: send → %s\n", o.signalURL)
+
+	case "recv":
+		rec = streamer.NewFrameReconstructor(o.seed)
+		sig := streamer.NewHTTPSignalingClient(o.signalURL)
+		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{
+			RingDepth: 4,
+			Compress:  o.compress,
+			OnPacket: func(b []byte) {
+				recvCount.Add(1)
+				if err := rec.Apply(b); err == nil {
+					reconFrames.Add(1)
+				}
+			},
+		})
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if err := rtc.DialAnswerer(dialCtx, sig); err != nil {
+			dialCancel()
+			fmt.Fprintf(os.Stderr, "dial answer: %v\n", err)
+			os.Exit(1)
+		}
+		dialCancel()
+		defer rtc.Stop()
+		fmt.Printf("webrtc: recv ← %s\n", o.signalURL)
+		// recv-only: wait for duration, then snapshot
+		<-ctx.Done()
+		time.Sleep(200 * time.Millisecond)
+		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
+		if o.snapshot != "" && rec != nil {
+			if err := rec.WritePNG(o.snapshot); err != nil {
+				fmt.Fprintf(os.Stderr, "snapshot: %v\n", err)
+			} else {
+				w, h := rec.Size()
+				fmt.Printf("snapshot=%s  %dx%d\n", o.snapshot, w, h)
+			}
+		}
+		return
+
+	default:
+		fmt.Fprintf(os.Stderr, "bad transport %q\n", o.transport)
+		os.Exit(1)
+	}
+
 	var grabber engine.Grabber
-	if *synthetic {
-		grabber = engine.NewSyntheticGrabber(*width, *height, *fps)
+	if o.synthetic {
+		grabber = engine.NewSyntheticGrabber(o.width, o.height, o.fps)
 	} else {
 		grabber = engine.NewGrabber()
 	}
-
 	cfg := engine.CaptureConfig{
-		FPS:          *fps,
-		BlockSize:    uint16(*block),
-		ScalePercent: *scale,
-		MaxWidth:     *maxW,
-		MaxHeight:    *maxH,
+		FPS: o.fps, BlockSize: uint16(o.block),
+		ScalePercent: o.scale, MaxWidth: o.maxW, MaxHeight: o.maxH,
 	}
-	if *exclude != "" {
-		cfg.ExcludeBundleIDs = splitCSV(*exclude)
+	if o.exclude != "" {
+		cfg.ExcludeBundleIDs = splitCSV(o.exclude)
 	}
-
 	if err := grabber.Open(ctx, cfg); err != nil {
 		var pe *engine.PermissionError
 		if errors.As(err, &pe) || errors.Is(err, engine.ErrPermissionDenied) {
@@ -66,103 +244,59 @@ func main() {
 	}
 	defer grabber.Close()
 
-	// Probe geometry — allow up to 8K for live.
-	maxProbeW, maxProbeH := *width, *height
-	if !*synthetic {
+	maxProbeW, maxProbeH := o.width, o.height
+	if !o.synthetic {
 		maxProbeW, maxProbeH = 7680, 4320
 	}
 	probe := make([]byte, maxProbeW*maxProbeH*4)
 	meta, err := grabber.Capture(ctx, probe)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "probe capture: %v\n", err)
+		fmt.Fprintf(os.Stderr, "probe: %v\n", err)
 		os.Exit(1)
 	}
-	*width, *height = int(meta.Width), int(meta.Height)
+	w, h := int(meta.Width), int(meta.Height)
 	stride := meta.Stride
 	if stride <= 0 {
-		stride = (*width) * 4
+		stride = w * 4
 	}
 	fmt.Printf("backend=%s  geometry=%dx%d  stride=%d  scale=%d%%\n",
-		grabber.Backend(), *width, *height, stride, *scale)
+		grabber.Backend(), w, h, stride, o.scale)
 
 	var detector engine.PIIDetector
-	if *pii {
+	if o.ocr {
+		detector = engine.NewOCRDetector(engine.StubOCRBackend{})
+	} else if o.pii {
 		pd := engine.NewPatternDetector()
-		pd.SetHits([]engine.Rect{{X: 0, Y: 0, W: uint16(*block), H: uint16(*block)}})
+		pd.SetHits([]engine.Rect{{X: 0, Y: 0, W: uint16(o.block), H: uint16(o.block)}})
 		detector = pd
 	}
 
 	pipe := engine.NewPipeline(engine.PipelineConfig{
-		Width:     *width,
-		Height:    *height,
-		Stride:    stride,
-		BlockSize: *block,
-		Detector:  detector,
-		XORSeed:   engine.DefaultXORSeed,
+		Width: w, Height: h, Stride: stride, BlockSize: o.block,
+		Detector: detector, XORSeed: o.seed,
 	})
 	defer pipe.Close()
 
-	var (
-		sink        streamer.Sink
-		recvCount   atomic.Uint64
-		reconFrames atomic.Uint64
-		senderRTC   *streamer.WebRTCSession
-		receiverRTC *streamer.WebRTCSession
-		rec         *streamer.FrameReconstructor
-	)
-
-	if *useWebRTC {
-		rec = streamer.NewFrameReconstructor(engine.DefaultXORSeed)
-		dialCtx, dialCancel := context.WithTimeout(context.Background(), 45*time.Second)
-		senderRTC, receiverRTC, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
-			RingDepth: 4,
-			Compress:  *compress,
-			OnPacket: func(b []byte) {
-				recvCount.Add(1)
-				if err := rec.Apply(b); err == nil {
-					reconFrames.Add(1)
-				}
-			},
-		})
-		dialCancel()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "webrtc: %v\n", err)
-			os.Exit(1)
-		}
-		defer senderRTC.Stop()
-		defer receiverRTC.Stop()
-		sink = senderRTC
-		fmt.Printf("webrtc: loopback open (compress=%v chunk=%dKiB)\n", *compress, streamer.DefaultChunkSize/1024)
-	} else {
-		local := streamer.NewLocalSink(4, nil)
-		_ = local.Start(ctx)
-		defer local.Stop()
-		sink = local
-	}
-
-	pool := engine.NewBufferPool(stride * (*height))
+	pool := engine.NewBufferPool(stride * h)
 	var fr engine.Frame
-
-	warmBuf := pool.Acquire()
+	warm := pool.Acquire()
 	for i := 0; i < 5; i++ {
-		m, err := grabber.Capture(ctx, warmBuf)
+		m, err := grabber.Capture(ctx, warm)
 		if err != nil {
 			break
 		}
-		fr = engine.Frame{Meta: m, Pixels: warmBuf}
-		pkt, err := pipe.Process(ctx, &fr)
-		if err == nil {
+		fr = engine.Frame{Meta: m, Pixels: warm}
+		if pkt, err := pipe.Process(ctx, &fr); err == nil {
 			sink.TryEnqueue(pkt)
 		}
 	}
-	pool.Release(warmBuf)
+	pool.Release(warm)
 
-	samples := make([]time.Duration, 0, int(*seconds*float64(*fps))+16)
+	samples := make([]time.Duration, 0, int(o.seconds*float64(o.fps))+16)
 	var frames int
 	var memBefore, memAfter runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&memBefore)
-
 	buf := pool.Acquire()
 	defer pool.Release(buf)
 
@@ -178,7 +312,6 @@ loop:
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				break
 			}
-			// Transient "no frame" under high-res load — skip, don't abort the run.
 			if errors.Is(err, engine.ErrBackendUnavailable) {
 				continue
 			}
@@ -204,14 +337,14 @@ loop:
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 
 	fmt.Printf("frames=%d  dropped=%d  sent=%d\n", frames, sink.Dropped(), sink.Sent())
-	if *useWebRTC {
+	if o.transport == "loopback" {
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
-		if *snapshot != "" && rec != nil {
-			if err := rec.WritePNG(*snapshot); err != nil {
+		if o.snapshot != "" && rec != nil {
+			if err := rec.WritePNG(o.snapshot); err != nil {
 				fmt.Fprintf(os.Stderr, "snapshot: %v\n", err)
 			} else {
 				cw, ch := rec.Size()
-				fmt.Printf("snapshot=%s  %dx%d\n", *snapshot, cw, ch)
+				fmt.Printf("snapshot=%s  %dx%d\n", o.snapshot, cw, ch)
 			}
 		}
 	}
@@ -228,11 +361,11 @@ loop:
 	}
 	mallocs := memAfter.Mallocs - memBefore.Mallocs
 	bytes := memAfter.TotalAlloc - memBefore.TotalAlloc
-	var perFrame float64
+	per := 0.0
 	if frames > 0 {
-		perFrame = float64(mallocs) / float64(frames)
+		per = float64(mallocs) / float64(frames)
 	}
-	fmt.Printf("heap_mallocs=%d  (~%.2f/frame)  total_alloc_bytes=%d\n", mallocs, perFrame, bytes)
+	fmt.Printf("heap_mallocs=%d  (~%.2f/frame)  total_alloc_bytes=%d\n", mallocs, per, bytes)
 	fmt.Println(streamer.DescribeHandoff())
 }
 
@@ -241,8 +374,7 @@ func splitCSV(s string) []string {
 	start := 0
 	for i := 0; i <= len(s); i++ {
 		if i == len(s) || s[i] == ',' {
-			part := s[start:i]
-			if part != "" {
+			if part := s[start:i]; part != "" {
 				out = append(out, part)
 			}
 			start = i + 1

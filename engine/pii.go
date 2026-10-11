@@ -44,6 +44,9 @@ func (d *PatternDetector) DetectInto(dst []Rect) []Rect {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if len(d.LayoutHits) == 0 {
+		if dst == nil {
+			return nil
+		}
 		return dst[:0]
 	}
 	return append(dst[:0], d.LayoutHits...)

@@ -21,15 +21,16 @@ type iceBody struct {
 	Candidate   ICECandidateJSON `json:"candidate"`
 }
 
-// HTTPSignalingHub is a tiny local signaling server for two peers.
+// HTTPSignalingHub is a tiny local signaling server for two peers (no cloud).
 type HTTPSignalingHub struct {
-	mu     sync.Mutex
-	offer  string
-	answer string
-	ice    []iceBody
-	cond   *sync.Cond
-	srv    *http.Server
-	addr   string
+	mu        sync.Mutex
+	offer     string
+	answer    string
+	iceOffer  []ICECandidateJSON // offerer → answerer
+	iceAnswer []ICECandidateJSON // answerer → offerer
+	cond      *sync.Cond
+	srv       *http.Server
+	addr      string
 }
 
 func NewHTTPSignalingHub() *HTTPSignalingHub {
@@ -40,6 +41,7 @@ func NewHTTPSignalingHub() *HTTPSignalingHub {
 
 func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 	mux.HandleFunc("/offer", h.handleOffer)
 	mux.HandleFunc("/answer", h.handleAnswer)
 	mux.HandleFunc("/ice", h.handleICE)
@@ -52,6 +54,8 @@ func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 	go func() { _ = h.srv.Serve(ln) }()
 	return "http://" + h.addr, nil
 }
+
+func (h *HTTPSignalingHub) Addr() string { return h.addr }
 
 func (h *HTTPSignalingHub) Close() error {
 	if h.srv == nil {
@@ -123,20 +127,36 @@ func (h *HTTPSignalingHub) handleICE(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.mu.Lock()
-		h.ice = append(h.ice, b)
+		if b.FromOfferer {
+			h.iceOffer = append(h.iceOffer, b.Candidate)
+		} else {
+			h.iceAnswer = append(h.iceAnswer, b.Candidate)
+		}
 		h.cond.Broadcast()
 		h.mu.Unlock()
 		w.WriteHeader(204)
 	case http.MethodGet:
+		// ?from=offer → fetch candidates produced by offerer (for answerer)
+		from := r.URL.Query().Get("from")
+		wantOffer := from != "answer"
 		h.mu.Lock()
-		// Long-poll: wait for any ICE if empty.
-		for len(h.ice) == 0 {
+		for {
+			if wantOffer && len(h.iceOffer) > 0 {
+				c := h.iceOffer[0]
+				h.iceOffer = h.iceOffer[1:]
+				h.mu.Unlock()
+				_ = json.NewEncoder(w).Encode(c)
+				return
+			}
+			if !wantOffer && len(h.iceAnswer) > 0 {
+				c := h.iceAnswer[0]
+				h.iceAnswer = h.iceAnswer[1:]
+				h.mu.Unlock()
+				_ = json.NewEncoder(w).Encode(c)
+				return
+			}
 			h.cond.Wait()
 		}
-		out := h.ice
-		h.ice = nil
-		h.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(out)
 	default:
 		http.Error(w, "method", 405)
 	}
@@ -146,14 +166,12 @@ func (h *HTTPSignalingHub) handleICE(w http.ResponseWriter, r *http.Request) {
 type HTTPSignalingClient struct {
 	base   string
 	client *http.Client
-	role   string // "offer" | "answer"
 }
 
-func NewHTTPSignalingClient(baseURL, role string) *HTTPSignalingClient {
+func NewHTTPSignalingClient(baseURL string) *HTTPSignalingClient {
 	return &HTTPSignalingClient{
 		base:   baseURL,
-		client: &http.Client{Timeout: 60 * time.Second},
-		role:   role,
+		client: &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
@@ -163,7 +181,6 @@ func (c *HTTPSignalingClient) SendOffer(sdp string) error {
 func (c *HTTPSignalingClient) SendAnswer(sdp string) error {
 	return c.postJSON("/answer", sdpBody{SDP: sdp})
 }
-
 func (c *HTTPSignalingClient) RecvOffer(ctx context.Context) (string, error) {
 	return c.getSDP(ctx, "/offer")
 }
@@ -176,27 +193,25 @@ func (c *HTTPSignalingClient) SendICE(fromOfferer bool, cand ICECandidateJSON) e
 }
 
 func (c *HTTPSignalingClient) RecvICE(ctx context.Context, fromOfferer bool) (ICECandidateJSON, error) {
-	for {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/ice", nil)
-		if err != nil {
-			return ICECandidateJSON{}, err
-		}
-		res, err := c.client.Do(req)
-		if err != nil {
-			return ICECandidateJSON{}, err
-		}
-		var list []iceBody
-		err = json.NewDecoder(res.Body).Decode(&list)
-		res.Body.Close()
-		if err != nil {
-			return ICECandidateJSON{}, err
-		}
-		for _, b := range list {
-			if b.FromOfferer == fromOfferer {
-				return b.Candidate, nil
-			}
-		}
+	// fromOfferer=true means we want candidates that came FROM the offerer.
+	q := "from=offer"
+	if !fromOfferer {
+		q = "from=answer"
 	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/ice?"+q, nil)
+	if err != nil {
+		return ICECandidateJSON{}, err
+	}
+	res, err := c.client.Do(req)
+	if err != nil {
+		return ICECandidateJSON{}, err
+	}
+	defer res.Body.Close()
+	var cnd ICECandidateJSON
+	if err := json.NewDecoder(res.Body).Decode(&cnd); err != nil {
+		return ICECandidateJSON{}, err
+	}
+	return cnd, nil
 }
 
 func (c *HTTPSignalingClient) postJSON(path string, v any) error {

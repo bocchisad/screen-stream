@@ -27,6 +27,8 @@ type WebRTCSession struct {
 	iceCancel context.CancelFunc
 	wg        sync.WaitGroup
 	packBuf   []byte
+	chunkBuf  []byte
+	sendCopy  []byte // reused per-chunk copy for dc.Send
 	mu        sync.Mutex
 	dcOpen    chan struct{}
 	dcOnce    sync.Once
@@ -61,6 +63,8 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 		compress:  cfg.Compress,
 		chunkSize: cfg.ChunkSize,
 		packBuf:   make([]byte, 0, 8<<20),
+		chunkBuf:  make([]byte, ChunkHeaderSize+DefaultChunkSize),
+		sendCopy:  make([]byte, ChunkHeaderSize+DefaultChunkSize),
 		dcOpen:    make(chan struct{}),
 	}
 	s.reasm = NewChunkReassembler(func(full []byte) {
@@ -277,9 +281,11 @@ func (s *WebRTCSession) sendPacket(pkt *engine.DirtyPacket) {
 		return
 	}
 	id := NextMsgID()
-	_ = SplitWire(id, buf, s.chunkSize, func(chunk []byte) error {
-		// Copy chunk: SplitWire may reuse buffer on next iteration.
-		cp := make([]byte, len(chunk))
+	_ = SplitWire(id, buf, s.chunkSize, s.chunkBuf, func(chunk []byte) error {
+		if cap(s.sendCopy) < len(chunk) {
+			s.sendCopy = make([]byte, len(chunk))
+		}
+		cp := s.sendCopy[:len(chunk)]
 		copy(cp, chunk)
 		return dc.Send(cp)
 	})
