@@ -35,3 +35,23 @@ func TestDeriveSessionSecretsBadLen(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestTranscriptHashSymmetric(t *testing.T) {
+	_, aPub, err := GenerateKXKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, bPub, err := GenerateKXKeypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h1 := TranscriptHash(aPub, bPub)
+	h2 := TranscriptHash(bPub, aPub)
+	if h1 != h2 || len(h1) != 16 {
+		t.Fatalf("hash mismatch %q vs %q", h1, h2)
+	}
+	_, cPub, _ := GenerateKXKeypair()
+	if TranscriptHash(aPub, cPub) == h1 {
+		t.Fatal("different peer should differ")
+	}
+}

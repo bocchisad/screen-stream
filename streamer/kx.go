@@ -1,10 +1,12 @@
 package streamer
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 
@@ -59,4 +61,21 @@ func DeriveSessionSecrets(priv, peerPub []byte) (aeadKey []byte, xorSeed uint64,
 		xorSeed = 1 // never use 0 (ResolveXORSeed sentinel)
 	}
 	return aeadKey, xorSeed, nil
+}
+
+// TranscriptHash is an order-independent SHA-256 fingerprint of the two X25519 pubs.
+// Display form: first 16 hex chars (64-bit prefix) for TOFU compare on both peers.
+func TranscriptHash(localPub, remotePub []byte) string {
+	if len(localPub) != 32 || len(remotePub) != 32 {
+		return ""
+	}
+	a, b := localPub, remotePub
+	if bytes.Compare(a, b) > 0 {
+		a, b = b, a
+	}
+	h := sha256.New()
+	_, _ = h.Write(a)
+	_, _ = h.Write(b)
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:8]) // 16 hex chars
 }

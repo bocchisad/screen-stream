@@ -1,10 +1,10 @@
-module github.com/salfetka/screen-stream/cmd/screen-stream
+module github.com/bocchisad/screen-stream/cmd/screen-stream
 
 go 1.21
 
 require (
-	github.com/salfetka/screen-stream/engine v0.0.0
-	github.com/salfetka/screen-stream/streamer v0.0.0
+	github.com/bocchisad/screen-stream/engine v0.0.0
+	github.com/bocchisad/screen-stream/streamer v0.0.0
 )
 
 require (
@@ -31,6 +31,6 @@ require (
 	golang.org/x/sys v0.30.0 // indirect
 )
 
-replace github.com/salfetka/screen-stream/engine => ../../engine
+replace github.com/bocchisad/screen-stream/engine => ../../engine
 
-replace github.com/salfetka/screen-stream/streamer => ../../streamer
+replace github.com/bocchisad/screen-stream/streamer => ../../streamer

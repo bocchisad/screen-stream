@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/salfetka/screen-stream/engine"
-	"github.com/salfetka/screen-stream/streamer"
+	"github.com/bocchisad/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/streamer"
 )
 
 func main() {
@@ -39,6 +39,10 @@ func main() {
 	excludeWin := flag.String("exclude-window", "", "macOS window IDs to exclude (comma-separated uint32)")
 	xorSeedFlag := flag.String("xor-seed", "", "bench/local RAM XOR seed (decimal/0xHEX); P2P uses ECDH-derived seed")
 	tokenFlag := flag.String("token", "", "required auth for hub/send/recv/preview; else env SCREEN_STREAM_TOKEN")
+	stunFlag := flag.String("stun", "", "optional STUN URL (e.g. stun:stun.l.google.com:19302)")
+	expectFP := flag.String("expect-fingerprint", "", "TOFU: exit 1 if ECDH transcript hash mismatches")
+	peerFlag := flag.String("peer", "default", "hub peer slot name (recv / single send)")
+	peersFlag := flag.String("peers", "", "send fanout: comma-separated peer names (overrides -peer)")
 	// legacy alias
 	webrtcAlias := flag.Bool("webrtc", false, "alias for -mode=loopback")
 	flag.Parse()
@@ -81,27 +85,34 @@ func main() {
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
 			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
-			seed: seed, token: token, transport: "local",
+			seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, transport: "local",
 		})
 	case "loopback":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
 			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
-			seed: seed, token: token, snapshot: *snapshot, preview: *preview, transport: "loopback",
+			seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP,
+			snapshot: *snapshot, preview: *preview, transport: "loopback",
 		})
 	case "send":
+		peers := splitCSV(*peersFlag)
+		if len(peers) == 0 {
+			peers = []string{*peerFlag}
+		}
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
 			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
-			seed: seed, token: token, transport: "send", signalURL: "http://" + *signalAddr,
+			seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, peers: peers,
+			transport: "send", signalURL: "http://" + *signalAddr,
 		})
 	case "recv":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
-			synthetic: true, // recv does not capture
-			compress: *compress, seed: seed, token: token, snapshot: *snapshot, preview: *preview,
+			synthetic: true,
+			compress: *compress, seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP,
+			peer: *peerFlag, snapshot: *snapshot, preview: *preview,
 			transport: "recv", signalURL: "http://" + *signalAddr,
 		})
 	default:
@@ -142,7 +153,8 @@ func runDoctor(signalAddr, token string) {
 	fmt.Println("screen-stream doctor")
 	fmt.Printf("  go=%s  os=%s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("  auth env %s set=%v\n", streamer.EnvAuthToken, token != "")
-	fmt.Printf("  ocr_available=%v  pipewire_builtin=%v\n", engine.OCRAvailable(), engine.PipeWireBuiltIn())
+	fmt.Printf("  ocr_available=%v  tesseract_available=%v  pipewire_builtin=%v\n",
+		engine.OCRAvailable(), engine.TesseractAvailable(), engine.PipeWireBuiltIn())
 
 	g := engine.NewGrabber()
 	fmt.Printf("  grabber backend=%s\n", g.Backend())
@@ -213,8 +225,51 @@ type sessionOpts struct {
 	snapshot                string
 	preview                 string // MJPEG listen addr
 	token                   string
+	stun                    string
+	expectFP                string
+	peer                    string
+	peers                   []string
 	transport               string // local | loopback | send | recv
 	signalURL               string
+}
+
+func checkFingerprint(got, expect string) {
+	if expect == "" {
+		return
+	}
+	if got != expect {
+		fmt.Fprintf(os.Stderr, "fingerprint mismatch: got %s want %s\n", got, expect)
+		os.Exit(1)
+	}
+}
+
+func startMetricsPusher(ctx context.Context, cli *streamer.HTTPSignalingClient, sessions ...*streamer.WebRTCSession) {
+	if cli == nil || len(sessions) == 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				var m streamer.PeerMetrics
+				for _, s := range sessions {
+					if s == nil {
+						continue
+					}
+					m.BytesSent += s.BytesSent()
+					m.BytesRecv += s.BytesRecv()
+					m.Sent += s.Sent()
+					m.Recv += s.Recv()
+					m.Dropped += s.Dropped()
+				}
+				_ = cli.PostMetrics(m)
+			}
+		}
+	}()
 }
 
 func runSession(o sessionOpts) {
@@ -249,6 +304,7 @@ func runSession(o sessionOpts) {
 		rtc, rtcPeer, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
+			STUNURL:   o.stun,
 			OnSessionReady: func(seed uint64) {
 				o.seed = seed
 				rec.SetSeed(seed)
@@ -267,29 +323,55 @@ func runSession(o sessionOpts) {
 			os.Exit(1)
 		}
 		o.seed = rtc.SessionSeed()
+		fp := rtc.SessionFingerprint()
+		checkFingerprint(fp, o.expectFP)
 		defer rtc.Stop()
 		defer rtcPeer.Stop()
 		sink = rtc
-		fmt.Printf("webrtc: loopback (compress=%v ecdh_seed=0x%X)\n", o.compress, o.seed)
+		fmt.Printf("webrtc: loopback (compress=%v ecdh_seed=0x%X fingerprint=%s)\n", o.compress, o.seed, fp)
 
 	case "send":
-		sig := streamer.NewHTTPSignalingClientToken(o.signalURL, o.token)
-		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{RingDepth: 4, Compress: o.compress})
+		peers := o.peers
+		if len(peers) == 0 {
+			peers = []string{"default"}
+		}
+		sessions := make([]*streamer.WebRTCSession, 0, len(peers))
+		var metricsCLI *streamer.HTTPSignalingClient
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
-		if err := rtc.DialOfferer(dialCtx, sig); err != nil {
-			dialCancel()
-			fmt.Fprintf(os.Stderr, "dial offer: %v\n", err)
-			fmt.Fprintf(os.Stderr, "hint: hub must be running, and recv should be started around the same time:\n")
-			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787 -token=…\n")
-			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -preview=127.0.0.1:8090 -token=…\n")
-			os.Exit(1)
+		for _, peer := range peers {
+			sig := streamer.NewHTTPSignalingClientPeer(o.signalURL, o.token, peer)
+			if metricsCLI == nil {
+				metricsCLI = sig
+			}
+			s := streamer.NewWebRTCSession(streamer.SessionConfig{
+				RingDepth: 4, Compress: o.compress, STUNURL: o.stun,
+			})
+			if err := s.DialOfferer(dialCtx, sig); err != nil {
+				dialCancel()
+				fmt.Fprintf(os.Stderr, "dial offer peer=%s: %v\n", peer, err)
+				os.Exit(1)
+			}
+			fp := s.SessionFingerprint()
+			checkFingerprint(fp, o.expectFP)
+			_ = s.StartSendLoop(context.Background())
+			sessions = append(sessions, s)
+			fmt.Printf("webrtc: send peer=%s fingerprint=%s ecdh_seed=0x%X\n", peer, fp, s.SessionSeed())
 		}
 		dialCancel()
-		o.seed = rtc.SessionSeed()
-		_ = rtc.StartSendLoop(context.Background())
-		defer rtc.Stop()
-		sink = rtc
-		fmt.Printf("webrtc: send → %s  ecdh_seed=0x%X\n", o.signalURL, o.seed)
+		o.seed = sessions[0].SessionSeed()
+		rtc = sessions[0]
+		defer func() {
+			for _, s := range sessions {
+				_ = s.Stop()
+			}
+		}()
+		if len(sessions) == 1 {
+			sink = sessions[0]
+		} else {
+			sink = streamer.NewFanoutSink(sessions...)
+		}
+		startMetricsPusher(ctx, metricsCLI, sessions...)
+		fmt.Printf("webrtc: send → %s peers=%v\n", o.signalURL, peers)
 
 	case "recv":
 		rec = streamer.NewFrameReconstructor(1)
@@ -298,10 +380,15 @@ func runSession(o sessionOpts) {
 			defer prev.Close()
 		}
 		var lastPrev time.Time
-		sig := streamer.NewHTTPSignalingClientToken(o.signalURL, o.token)
+		peer := o.peer
+		if peer == "" {
+			peer = "default"
+		}
+		sig := streamer.NewHTTPSignalingClientPeer(o.signalURL, o.token, peer)
 		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
+			STUNURL:   o.stun,
 			OnSessionReady: func(seed uint64) {
 				o.seed = seed
 				rec.SetSeed(seed)
@@ -318,17 +405,16 @@ func runSession(o sessionOpts) {
 		if err := rtc.DialAnswerer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial answer: %v\n", err)
-			fmt.Fprintf(os.Stderr, "hint: need THREE terminals, same -token:\n")
-			fmt.Fprintf(os.Stderr, "  1) go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787 -token=…\n")
-			fmt.Fprintf(os.Stderr, "  2) go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 -synthetic=false -seconds=30 -token=…\n")
-			fmt.Fprintf(os.Stderr, "  3) go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -seconds=30 -preview=127.0.0.1:8090 -token=…\n")
-			fmt.Fprintf(os.Stderr, "start send+recv while hub is up; if stuck, restart hub.\n")
+			fmt.Fprintf(os.Stderr, "hint: hub + send + recv, same -token; matching -peer / -peers\n")
 			os.Exit(1)
 		}
 		dialCancel()
 		o.seed = rtc.SessionSeed()
+		fp := rtc.SessionFingerprint()
+		checkFingerprint(fp, o.expectFP)
 		defer rtc.Stop()
-		fmt.Printf("webrtc: recv ← %s  ecdh_seed=0x%X\n", o.signalURL, o.seed)
+		startMetricsPusher(ctx, sig, rtc)
+		fmt.Printf("webrtc: recv ← %s peer=%s ecdh_seed=0x%X fingerprint=%s\n", o.signalURL, peer, o.seed, fp)
 		<-ctx.Done()
 		time.Sleep(200 * time.Millisecond)
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())

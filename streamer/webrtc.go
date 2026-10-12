@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/pion/webrtc/v4"
-	"github.com/salfetka/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/engine"
 )
 
 const DefaultChannelLabel = "screen-frames"
@@ -43,6 +43,8 @@ type WebRTCSession struct {
 	aeadBuf   []byte
 	seed           uint64 // session XOR seed (ECDH-derived after dial)
 	kxPriv         []byte
+	fingerprint    string
+	stunURL        string
 	disableAEAD    bool
 	onSessionReady func(uint64)
 }
@@ -55,6 +57,7 @@ type SessionConfig struct {
 	Compress       bool
 	ChunkSize      int
 	DisableAEAD    bool // test-only
+	STUNURL        string
 	// Seed is unused for wire keys when ECDH succeeds; kept for DisableAEAD tests.
 	Seed uint64
 }
@@ -77,6 +80,7 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 		compress:       cfg.Compress,
 		chunkSize:      cfg.ChunkSize,
 		seed:           cfg.Seed,
+		stunURL:        cfg.STUNURL,
 		disableAEAD:    cfg.DisableAEAD,
 		packBuf:        make([]byte, 0, 8<<20),
 		chunkBuf:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
@@ -106,6 +110,19 @@ func (s *WebRTCSession) SessionSeed() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.seed
+}
+
+// SessionFingerprint is the TOFU transcript hash (valid after Dial*).
+func (s *WebRTCSession) SessionFingerprint() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fingerprint
+}
+
+func (s *WebRTCSession) setFingerprint(localPub, remotePub []byte) {
+	s.mu.Lock()
+	s.fingerprint = TranscriptHash(localPub, remotePub)
+	s.mu.Unlock()
 }
 
 func (s *WebRTCSession) applySessionKeys(aeadKey []byte, xorSeed uint64) error {
@@ -140,15 +157,20 @@ func (s *WebRTCSession) BytesSent() uint64                  { return s.bytesSent
 func (s *WebRTCSession) BytesRecv() uint64                  { return s.bytesRecv.Load() }
 func (s *WebRTCSession) Dropped() uint64                    { return s.ring.Dropped() }
 
-func defaultPCConfig() webrtc.Configuration {
-	return webrtc.Configuration{}
+// PeerConfig builds pion ICE config. Empty stunURL → host candidates only.
+func PeerConfig(stunURL string) webrtc.Configuration {
+	cfg := webrtc.Configuration{}
+	if stunURL != "" {
+		cfg.ICEServers = []webrtc.ICEServer{{URLs: []string{stunURL}}}
+	}
+	return cfg
 }
 
-func newPeerConnection() (*webrtc.PeerConnection, error) {
+func newPeerConnection(stunURL string) (*webrtc.PeerConnection, error) {
 	se := webrtc.SettingEngine{}
 	se.SetSCTPMaxMessageSize(16 << 20)
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
-	return api.NewPeerConnection(defaultPCConfig())
+	return api.NewPeerConnection(PeerConfig(stunURL))
 }
 
 func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
@@ -159,7 +181,7 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	}
 	s.kxPriv = priv
 
-	pc, err := newPeerConnection()
+	pc, err := newPeerConnection(s.stunURL)
 	if err != nil {
 		return err
 	}
@@ -194,6 +216,7 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	if err != nil {
 		return fmt.Errorf("ecdh: %w", err)
 	}
+	s.setFingerprint(pub, ans.PubKey)
 	if err := s.applySessionKeys(aeadKey, xorSeed); err != nil {
 		return err
 	}
@@ -211,7 +234,7 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	}
 	s.kxPriv = priv
 
-	pc, err := newPeerConnection()
+	pc, err := newPeerConnection(s.stunURL)
 	if err != nil {
 		return err
 	}
@@ -229,6 +252,7 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	if err != nil {
 		return fmt.Errorf("ecdh: %w", err)
 	}
+	s.setFingerprint(pub, off.PubKey)
 	if err := s.applySessionKeys(aeadKey, xorSeed); err != nil {
 		return err
 	}

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/salfetka/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/engine"
 )
 
 func BenchmarkPipelineAllocs(b *testing.B) {

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/salfetka/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/engine"
 )
 
 // Sink is a non-blocking consumer of DirtyPackets.
@@ -65,6 +65,89 @@ func (s *LocalSink) Start(ctx context.Context) error {
 		}
 	}()
 	return nil
+}
+
+// FanoutSink enqueues the same DirtyPacket to multiple WebRTC sessions (multi-viewer).
+type FanoutSink struct {
+	sessions []*WebRTCSession
+}
+
+func NewFanoutSink(sessions ...*WebRTCSession) *FanoutSink {
+	return &FanoutSink{sessions: sessions}
+}
+
+func (f *FanoutSink) Start(ctx context.Context) error { _ = ctx; return nil }
+func (f *FanoutSink) Stop() error {
+	for _, s := range f.sessions {
+		if s != nil {
+			_ = s.Stop()
+		}
+	}
+	return nil
+}
+
+func (f *FanoutSink) TryEnqueue(pkt *engine.DirtyPacket) {
+	if pkt == nil || len(f.sessions) == 0 {
+		return
+	}
+	// First session owns the pooled packet; others get heap clones (pool=nil → Release no-op).
+	for i, s := range f.sessions {
+		if s == nil {
+			continue
+		}
+		if i == 0 {
+			s.TryEnqueue(pkt)
+			continue
+		}
+		s.TryEnqueue(cloneDirtyPacket(pkt))
+	}
+}
+
+func (f *FanoutSink) Dropped() uint64 {
+	var n uint64
+	for _, s := range f.sessions {
+		if s != nil {
+			n += s.Dropped()
+		}
+	}
+	return n
+}
+
+func (f *FanoutSink) Sent() uint64 {
+	var n uint64
+	for _, s := range f.sessions {
+		if s != nil {
+			n += s.Sent()
+		}
+	}
+	return n
+}
+
+func (f *FanoutSink) BytesSent() uint64 {
+	var n uint64
+	for _, s := range f.sessions {
+		if s != nil {
+			n += s.BytesSent()
+		}
+	}
+	return n
+}
+
+func cloneDirtyPacket(pkt *engine.DirtyPacket) *engine.DirtyPacket {
+	if pkt == nil {
+		return nil
+	}
+	cp := &engine.DirtyPacket{
+		FrameID:   pkt.FrameID,
+		PTSUs:     pkt.PTSUs,
+		Width:     pkt.Width,
+		Height:    pkt.Height,
+		BlockSize: pkt.BlockSize,
+		Flags:     pkt.Flags,
+		Regions:   append([]engine.DirtyRegion(nil), pkt.Regions...),
+		Payload:   append([]byte(nil), pkt.Payload...),
+	}
+	return cp
 }
 
 func (s *LocalSink) Stop() error {

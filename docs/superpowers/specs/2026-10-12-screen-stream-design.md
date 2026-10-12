@@ -1,7 +1,7 @@
 # Design: Privacy-preserving P2P screen stream engine
 
 **Date:** 2026-10-12  
-**Codename:** screen-stream (module path: `github.com/salfetka/screen-stream`)  
+**Codename:** screen-stream (module path: `github.com/bocchisad/screen-stream`)  
 **Stack:** Go 1.20+ (core) + cgo (platform capture) + pion/webrtc (P2P data channel)
 
 ## Goals

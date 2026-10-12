@@ -7,7 +7,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/salfetka/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/engine"
 )
 
 // FrameReconstructor applies dirty tiles onto a BGRA canvas (decrypts with shared seed).

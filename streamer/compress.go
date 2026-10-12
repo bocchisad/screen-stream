@@ -7,7 +7,7 @@ import (
 	"io"
 	"sync"
 
-	"github.com/salfetka/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/engine"
 )
 
 var (

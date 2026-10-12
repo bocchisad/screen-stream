@@ -1,3 +1,3 @@
-module github.com/salfetka/screen-stream/engine
+module github.com/bocchisad/screen-stream/engine
 
 go 1.21

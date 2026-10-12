@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/salfetka/screen-stream/engine"
+	"github.com/bocchisad/screen-stream/engine"
 )
 
 func TestWebRTCLoopback(t *testing.T) {
