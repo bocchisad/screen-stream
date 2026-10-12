@@ -127,6 +127,17 @@ func (g *macGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, error)
 	}, nil
 }
 
+func (g *macGrabber) OutputSize() (width, height, stride int, ok bool) {
+	if !g.started {
+		return 0, 0, 0, false
+	}
+	var w, h, s C.int
+	if int(C.ss_mac_output_size(&w, &h, &s)) != 0 {
+		return 0, 0, 0, false
+	}
+	return int(w), int(h), int(s), true
+}
+
 func (g *macGrabber) Close() error {
 	if !g.started {
 		return nil
@@ -135,3 +146,5 @@ func (g *macGrabber) Close() error {
 	g.started = false
 	return nil
 }
+
+var _ OutputSizer = (*macGrabber)(nil)

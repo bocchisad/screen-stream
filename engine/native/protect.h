@@ -45,6 +45,24 @@ void ss_fill_black(
     int x, int y, int w, int h
 );
 
+/*
+ * One cgo round-trip: hash plain → curr_hashes, then diff vs prev into out_rects.
+ * Returns dirty rect count. have_prev=0 treats all blocks dirty unless force_all.
+ */
+int ss_hash_and_diff(
+    const uint8_t *plain,
+    int width,
+    int height,
+    int stride,
+    int block_size,
+    uint64_t *curr_hashes,
+    const uint64_t *prev_hashes,
+    int have_prev,
+    int force_all,
+    uint16_t *out_rects,
+    int max_out
+);
+
 #ifdef __cplusplus
 }
 #endif

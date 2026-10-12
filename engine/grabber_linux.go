@@ -118,6 +118,17 @@ func (g *linuxGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, erro
 	}, nil
 }
 
+func (g *linuxGrabber) OutputSize() (width, height, stride int, ok bool) {
+	if !g.started || g.backend == "pipewire" {
+		return 0, 0, 0, false
+	}
+	var w, h, s C.int
+	if int(C.ss_x11_output_size(&w, &h, &s)) != 0 {
+		return 0, 0, 0, false
+	}
+	return int(w), int(h), int(s), true
+}
+
 func (g *linuxGrabber) Close() error {
 	if !g.started {
 		return nil
@@ -131,3 +142,5 @@ func (g *linuxGrabber) Close() error {
 	g.started = false
 	return nil
 }
+
+var _ OutputSizer = (*linuxGrabber)(nil)

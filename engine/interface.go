@@ -91,15 +91,12 @@ type DirtyPacket struct {
 const PacketMagic uint32 = 0x53535231 // "SSR1"
 
 // Release returns packet backing store to the pool.
+// Must not nil Payload/Regions after enqueue — that would force realloc on next Acquire.
 func (p *DirtyPacket) Release() {
 	if p == nil || p.pool == nil {
 		return
 	}
 	p.pool.Release(p)
-	p.Payload = nil
-	p.Regions = nil
-	p.raw = nil
-	p.pool = nil
 }
 
 // Grabber captures screen frames into caller-provided / pool buffers.
@@ -110,6 +107,11 @@ type Grabber interface {
 	Capture(ctx context.Context, dst []byte) (FrameMeta, error)
 	Close() error
 	Backend() string
+}
+
+// OutputSizer is optional: report configured geometry after Open (no probe frame).
+type OutputSizer interface {
+	OutputSize() (width, height, stride int, ok bool)
 }
 
 // CaptureConfig controls capture session.

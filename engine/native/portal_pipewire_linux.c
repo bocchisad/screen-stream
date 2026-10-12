@@ -61,6 +61,8 @@ static GDBusProxy *gPortal = NULL;
 static struct pw_main_loop *gLoop = NULL;
 static struct pw_stream *gStream = NULL;
 
+static char gSessionHandle[256];
+
 static int portal_create_session(void) {
     GError *err = NULL;
     if (!gPortal) {
@@ -79,9 +81,27 @@ static int portal_create_session(void) {
             return 2;
         }
     }
+    /* CreateSession(a{sv}) → request object path. Full flow waits on Response;
+     * here we only prove the portal bus is reachable. */
+    GVariantBuilder b;
+    g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
+    GVariant *ret = g_dbus_proxy_call_sync(
+        gPortal, "CreateSession",
+        g_variant_new("(a{sv})", &b),
+        G_DBUS_CALL_FLAGS_NONE, 5000, NULL, &err);
+    if (!ret) {
+        set_err(err ? err->message : "CreateSession failed");
+        if (err) g_error_free(err);
+        return 2;
+    }
+    const char *path = NULL;
+    g_variant_get(ret, "(o)", &path);
+    if (path) {
+        snprintf(gSessionHandle, sizeof(gSessionHandle), "%s", path);
+    }
+    g_variant_unref(ret);
     gState = PW_STATE_SESSION;
     set_err(NULL);
-    /* CreateSession(options) → request handle; wait Response signal for session handle */
     return 0;
 }
 
@@ -155,6 +175,24 @@ int ss_pw_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
     return 2;
 }
 
+int ss_pw_output_size(int *out_w, int *out_h, int *out_stride) {
+    if (!out_w || !out_h || !out_stride) return 3;
+    if (gWidth <= 0 || gHeight <= 0) return 2;
+    *out_w = gWidth;
+    *out_h = gHeight;
+    *out_stride = gWidth * 4;
+    return 0;
+}
+
+int ss_pw_last_error(char *buf, int buflen) {
+    if (!buf || buflen <= 0) return 0;
+    size_t n = strlen(gLastError);
+    if ((int)n >= buflen) n = (size_t)buflen - 1;
+    memcpy(buf, gLastError, n);
+    buf[n] = 0;
+    return (int)n;
+}
+
 #else
 
 int ss_pw_start(int fps) {
@@ -174,6 +212,20 @@ int ss_pw_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
     (void)dst; (void)dst_len; (void)info;
     (void)gWidth; (void)gHeight; (void)gNodeID; (void)gFPS;
     return 2;
+}
+
+int ss_pw_output_size(int *out_w, int *out_h, int *out_stride) {
+    (void)out_w; (void)out_h; (void)out_stride;
+    return 2;
+}
+
+int ss_pw_last_error(char *buf, int buflen) {
+    if (!buf || buflen <= 0) return 0;
+    size_t n = strlen(gLastError);
+    if ((int)n >= buflen) n = (size_t)buflen - 1;
+    memcpy(buf, gLastError, n);
+    buf[n] = 0;
+    return (int)n;
 }
 
 #endif

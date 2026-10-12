@@ -95,13 +95,10 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 	xorBuffer(frame.Pixels[:need], &k)
 	frame.Protected = true
 
-	bx := (w + p.blockSize - 1) / p.blockSize
-	by := (h + p.blockSize - 1) / p.blockSize
-	blockHashes(p.plain[:need], w, h, stride, p.blockSize, p.currHashes)
-
 	p.frameCount++
 	force := !p.havePrev || (p.frameCount%p.keyEvery == 0)
-	n := diffBlocks(p.currHashes, p.prevHashes, bx, by, p.blockSize, w, h, p.rectScratch, force)
+	n := hashAndDiff(p.plain[:need], w, h, stride, p.blockSize,
+		p.currHashes, p.prevHashes, p.havePrev, force, p.rectScratch)
 
 	if p.detector != nil {
 		if pd, ok := p.detector.(*PatternDetector); ok {

@@ -101,7 +101,24 @@ int ss_diff_blocks(
             }
         }
     }
-    return count;
+    /* Vertical merge: same x,w and contiguous y → one taller rect. */
+    int wcount = 0;
+    for (int i = 0; i < count; i++) {
+        uint16_t x = out_rects[i * 4 + 0];
+        uint16_t y = out_rects[i * 4 + 1];
+        uint16_t w = out_rects[i * 4 + 2];
+        uint16_t h = out_rects[i * 4 + 3];
+        if (wcount > 0) {
+            uint16_t *p = &out_rects[(wcount - 1) * 4];
+            if (p[0] == x && p[2] == w && p[1] + p[3] == y) {
+                p[3] = (uint16_t)(p[3] + h);
+                continue;
+            }
+        }
+        write_rect(out_rects, wcount, x, y, w, h);
+        wcount++;
+    }
+    return wcount;
 }
 
 void ss_fill_black(uint8_t *bgra, int stride, int x, int y, int w, int h) {
@@ -114,4 +131,25 @@ void ss_fill_black(uint8_t *bgra, int stride, int x, int y, int w, int h) {
             p[col * 4 + 3] = 255;
         }
     }
+}
+
+int ss_hash_and_diff(
+    const uint8_t *plain,
+    int width,
+    int height,
+    int stride,
+    int block_size,
+    uint64_t *curr_hashes,
+    const uint64_t *prev_hashes,
+    int have_prev,
+    int force_all,
+    uint16_t *out_rects,
+    int max_out
+) {
+    int bx = (width + block_size - 1) / block_size;
+    int by = (height + block_size - 1) / block_size;
+    ss_block_hashes(plain, width, height, stride, block_size, curr_hashes);
+    int force = force_all || !have_prev;
+    return ss_diff_blocks(curr_hashes, prev_hashes, bx, by, block_size,
+                          width, height, out_rects, max_out, force);
 }

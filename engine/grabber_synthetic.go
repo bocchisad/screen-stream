@@ -86,6 +86,14 @@ func (g *SyntheticGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, 
 	}, nil
 }
 
+func (g *SyntheticGrabber) OutputSize() (width, height, stride int, ok bool) {
+	if g.Width <= 0 || g.Height <= 0 {
+		return 0, 0, 0, false
+	}
+	return g.Width, g.Height, g.Width * 4, true
+}
+
 func (g *SyntheticGrabber) Close() error { return nil }
 
 var _ Grabber = (*SyntheticGrabber)(nil)
+var _ OutputSizer = (*SyntheticGrabber)(nil)

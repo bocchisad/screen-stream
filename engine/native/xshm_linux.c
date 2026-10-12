@@ -80,6 +80,16 @@ int ss_x11_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
     return 0;
 }
 
+int ss_x11_output_size(int *out_w, int *out_h, int *out_stride) {
+    if (!out_w || !out_h || !out_stride) return 3;
+    if (!gDisp || gWidth <= 0 || gHeight <= 0) return 2;
+    *out_w = gWidth;
+    *out_h = gHeight;
+    if (gImage) *out_stride = gImage->bytes_per_line;
+    else *out_stride = gWidth * 4;
+    return 0;
+}
+
 int ss_x11_stop(void) {
     if (gDisp && gUseShm && gImage) {
         XShmDetach(gDisp, &gShm);
@@ -105,6 +115,10 @@ int ss_x11_stop(void) {
 
 int ss_x11_available(void) { return 0; }
 int ss_x11_start(int screen_index) { (void)screen_index; return 2; }
+int ss_x11_output_size(int *out_w, int *out_h, int *out_stride) {
+    (void)out_w; (void)out_h; (void)out_stride;
+    return 2;
+}
 int ss_x11_stop(void) { return 0; }
 int ss_x11_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
     (void)dst; (void)dst_len; (void)info;

@@ -22,6 +22,8 @@ type WebRTCSession struct {
 	dc        *webrtc.DataChannel
 	sent      atomic.Uint64
 	recv      atomic.Uint64
+	bytesSent atomic.Uint64
+	bytesRecv atomic.Uint64
 	onPacket  func([]byte) // full reassembled DirtyPacket wire
 	cancel    context.CancelFunc
 	iceCancel context.CancelFunc
@@ -69,6 +71,7 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 	}
 	s.reasm = NewChunkReassembler(func(full []byte) {
 		s.recv.Add(1)
+		s.bytesRecv.Add(uint64(len(full)))
 		if s.onPacket != nil {
 			s.onPacket(full)
 		}
@@ -79,6 +82,8 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 func (s *WebRTCSession) TryEnqueue(pkt *engine.DirtyPacket) { s.ring.TryEnqueue(pkt) }
 func (s *WebRTCSession) Sent() uint64                       { return s.sent.Load() }
 func (s *WebRTCSession) Recv() uint64                       { return s.recv.Load() }
+func (s *WebRTCSession) BytesSent() uint64                  { return s.bytesSent.Load() }
+func (s *WebRTCSession) BytesRecv() uint64                  { return s.bytesRecv.Load() }
 func (s *WebRTCSession) Dropped() uint64                    { return s.ring.Dropped() }
 
 func defaultPCConfig() webrtc.Configuration {
@@ -285,15 +290,18 @@ func (s *WebRTCSession) sendPacket(pkt *engine.DirtyPacket) {
 		return
 	}
 	id := NextMsgID()
+	var wireBytes int
 	_ = SplitWire(id, buf, s.chunkSize, s.chunkBuf, func(chunk []byte) error {
 		if cap(s.sendCopy) < len(chunk) {
 			s.sendCopy = make([]byte, len(chunk))
 		}
 		cp := s.sendCopy[:len(chunk)]
 		copy(cp, chunk)
+		wireBytes += len(cp)
 		return dc.Send(cp)
 	})
 	s.sent.Add(1)
+	s.bytesSent.Add(uint64(wireBytes))
 }
 
 func (s *WebRTCSession) Stop() error {

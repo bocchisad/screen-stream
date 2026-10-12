@@ -96,6 +96,7 @@ static atomic_int gFrameReady = 0;
 static SCStream *gStream = nil;
 static SSStreamDelegate *gDelegate = nil;
 static NSMutableArray<NSString *> *gExcludeBundles = nil;
+static int gOutW = 0, gOutH = 0, gOutStride = 0;
 
 int ss_mac_preflight(void) {
     if (@available(macOS 14.0, *)) {
@@ -203,6 +204,11 @@ int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, in
     cfg.minimumFrameInterval = CMTimeMake(1, fps);
     cfg.queueDepth = 3;
 
+    gOutW = outW;
+    gOutH = outH;
+    /* CVPixelBuffer rows are often 64-byte aligned — pad until first frame updates. */
+    gOutStride = ((outW * 4) + 63) & ~63;
+
     gDelegate = [[SSStreamDelegate alloc] init];
     gStream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:gDelegate];
 
@@ -223,6 +229,15 @@ int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, in
     return startResult;
 }
 
+int ss_mac_output_size(int *out_w, int *out_h, int *out_stride) {
+    if (!out_w || !out_h || !out_stride) return 3;
+    if (gOutW <= 0 || gOutH <= 0) return 2;
+    *out_w = gOutW;
+    *out_h = gOutH;
+    *out_stride = gOutStride > 0 ? gOutStride : gOutW * 4;
+    return 0;
+}
+
 int ss_mac_stop(void) {
     if (!gStream) return 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -233,6 +248,7 @@ int ss_mac_stop(void) {
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
     gStream = nil;
     gDelegate = nil;
+    gOutW = gOutH = gOutStride = 0;
     return 0;
 }
 
@@ -254,5 +270,8 @@ int ss_mac_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
     info->width = w;
     info->height = h;
     info->stride = stride;
+    gOutW = w;
+    gOutH = h;
+    gOutStride = stride;
     return 0;
 }

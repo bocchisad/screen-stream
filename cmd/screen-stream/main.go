@@ -5,9 +5,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,7 +19,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "bench", "bench | hub | send | recv | loopback")
+	mode := flag.String("mode", "bench", "bench | hub | send | recv | loopback | doctor")
 	signalAddr := flag.String("signal", "127.0.0.1:8787", "signaling listen/dial host:port")
 	seconds := flag.Float64("seconds", 3, "run duration (bench/send/recv/loopback)")
 	fps := flag.Int("fps", 60, "target FPS")
@@ -60,6 +63,8 @@ func main() {
 	switch *mode {
 	case "hub":
 		runHub(*signalAddr)
+	case "doctor":
+		runDoctor(*signalAddr)
 	case "bench":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
@@ -114,6 +119,51 @@ func runHub(addr string) {
 	fmt.Printf("  send: go run ./cmd/screen-stream -mode=send -signal=%s -synthetic=false -scale=75 -seconds=30\n", clientAddr)
 	fmt.Printf("  recv: go run ./cmd/screen-stream -mode=recv -signal=%s -seconds=30 -snapshot=/tmp/recv.png\n", clientAddr)
 	select {}
+}
+
+func runDoctor(signalAddr string) {
+	fmt.Println("screen-stream doctor")
+	fmt.Printf("  go=%s  os=%s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("  xor_seed default=0x%X  env %s=%q\n", engine.DefaultXORSeed, engine.EnvXORSeedKey, os.Getenv(engine.EnvXORSeedKey))
+
+	g := engine.NewGrabber()
+	fmt.Printf("  grabber backend=%s\n", g.Backend())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := g.Open(ctx, engine.CaptureConfig{FPS: 30, ScalePercent: 50, BlockSize: 64})
+	if err != nil {
+		fmt.Printf("  capture open: FAIL %v\n", err)
+	} else {
+		buf := make([]byte, 4096*2304*4)
+		meta, cerr := g.Capture(ctx, buf)
+		_ = g.Close()
+		if cerr != nil {
+			fmt.Printf("  capture frame: FAIL %v\n", cerr)
+		} else {
+			fmt.Printf("  capture frame: OK %dx%d stride=%d\n", meta.Width, meta.Height, meta.Stride)
+		}
+	}
+
+	base := "http://" + signalAddr
+	res, err := httpGetStatus(base)
+	if err != nil {
+		fmt.Printf("  hub %s: DOWN (%v)\n", base, err)
+		fmt.Println("  hint: go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787")
+	} else {
+		fmt.Printf("  hub %s: UP %s\n", base, res)
+	}
+	fmt.Println("  preview URL (while recv runs): http://127.0.0.1:8090/")
+}
+
+func httpGetStatus(base string) (string, error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	res, err := client.Get(base + "/status")
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	b, _ := io.ReadAll(res.Body)
+	return strings.TrimSpace(string(b)), nil
 }
 
 func splitHostPort(addr string) (host, port string, err error) {
@@ -244,6 +294,8 @@ func runSession(o sessionOpts) {
 		<-ctx.Done()
 		time.Sleep(200 * time.Millisecond)
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
+		mbps := float64(rtc.BytesRecv()) * 8 / maxFloat(o.seconds, 1) / 1e6
+		fmt.Printf("wire_bytes_recv=%d  (~%.2f Mbit/s avg)\n", rtc.BytesRecv(), mbps)
 		if o.snapshot != "" && rec != nil {
 			if err := rec.WritePNG(o.snapshot); err != nil {
 				fmt.Fprintf(os.Stderr, "snapshot: %v\n", err)
@@ -283,18 +335,26 @@ func runSession(o sessionOpts) {
 	}
 	defer grabber.Close()
 
-	maxProbeW, maxProbeH := o.width, o.height
-	if !o.synthetic {
-		maxProbeW, maxProbeH = 7680, 4320
+	w, h, stride := 0, 0, 0
+	if sz, ok := grabber.(engine.OutputSizer); ok {
+		if ww, hh, ss, ok := sz.OutputSize(); ok {
+			w, h, stride = ww, hh, ss
+		}
 	}
-	probe := make([]byte, maxProbeW*maxProbeH*4)
-	meta, err := grabber.Capture(ctx, probe)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "probe: %v\n", err)
-		os.Exit(1)
+	if w <= 0 || h <= 0 {
+		// Fallback: one probe frame (sized conservatively).
+		maxW, maxH := o.width, o.height
+		if !o.synthetic {
+			maxW, maxH = 3840, 2160
+		}
+		probe := make([]byte, maxW*maxH*4)
+		meta, err := grabber.Capture(ctx, probe)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "probe: %v\n", err)
+			os.Exit(1)
+		}
+		w, h, stride = int(meta.Width), int(meta.Height), meta.Stride
 	}
-	w, h := int(meta.Width), int(meta.Height)
-	stride := meta.Stride
 	if stride <= 0 {
 		stride = w * 4
 	}
@@ -384,8 +444,20 @@ loop:
 	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
 
 	fmt.Printf("frames=%d  dropped=%d  sent=%d\n", frames, sink.Dropped(), sink.Sent())
+	if bs, ok := sink.(interface{ BytesSent() uint64 }); ok {
+		elapsed := o.seconds
+		if elapsed <= 0 {
+			elapsed = 1
+		}
+		mbps := float64(bs.BytesSent()) * 8 / elapsed / 1e6
+		fmt.Printf("wire_bytes_sent=%d  (~%.2f Mbit/s avg)\n", bs.BytesSent(), mbps)
+	}
 	if o.transport == "loopback" {
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
+		if rtcPeer != nil {
+			mbps := float64(rtcPeer.BytesRecv()) * 8 / maxFloat(o.seconds, 1) / 1e6
+			fmt.Printf("wire_bytes_recv=%d  (~%.2f Mbit/s avg)\n", rtcPeer.BytesRecv(), mbps)
+		}
 		if o.snapshot != "" && rec != nil {
 			if err := rec.WritePNG(o.snapshot); err != nil {
 				fmt.Fprintf(os.Stderr, "snapshot: %v\n", err)
@@ -442,6 +514,13 @@ func maybePreview(p *streamer.PreviewServer, rec *streamer.FrameReconstructor, l
 	rec.WithCanvas(func(bgra []byte, w, h, stride int) {
 		_ = p.UpdateFromBGRA(bgra, w, h, stride)
 	})
+}
+
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func splitCSV(s string) []string {

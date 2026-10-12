@@ -17,6 +17,9 @@ int ss_wayland_session(void); /* 1 if Wayland session detected */
 int ss_pw_start(int fps);
 int ss_pw_stop(void);
 int ss_pw_capture(uint8_t *dst, int dst_len, ss_frame_info *info);
+int ss_pw_output_size(int *out_w, int *out_h, int *out_stride);
+/* Copies last error message; returns bytes written (excl NUL), or 0. */
+int ss_pw_last_error(char *buf, int buflen);
 
 #ifdef __cplusplus
 }

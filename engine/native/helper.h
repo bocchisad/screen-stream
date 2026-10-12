@@ -23,6 +23,9 @@ int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, in
 int ss_mac_stop(void);
 int ss_mac_display_pixels(int display_index, int *out_w, int *out_h);
 
+/* After ss_mac_start_ex: configured output geometry (stride ≈ width*4 until first frame). */
+int ss_mac_output_size(int *out_w, int *out_h, int *out_stride);
+
 /*
  * Copies latest BGRA frame into dst (dst_len bytes).
  * Returns 0 on success, fills info. Non-blocking: returns 4 if no new frame.

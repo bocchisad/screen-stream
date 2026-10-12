@@ -53,17 +53,20 @@ Exit `2` = screen permission denied.
 
 | Spec item | Status |
 |-----------|--------|
-| Zero-alloc capture pool | Done (engine freelist; PacketPool non-blocking) |
+| Zero-alloc capture pool | Done (~0–1 alloc/frame after warmup; pure-Go XOR/hash/diff) |
 | macOS ScreenCaptureKit BGRA + filter | Done (Retina native) |
 | Linux X11 XShm | Done |
-| Wayland PipeWire | State-machine skeleton; full portal needs `-DSS_HAVE_PIPEWIRE=1` |
-| Frame diff + dirty boxes | Done (word-sized FNV hash; horizontal run merge) |
-| RAM XOR protect | Done (C via cgo) |
+| Wayland PipeWire | Portal CreateSession plumbing when `-DSS_HAVE_PIPEWIRE=1`; capture still needs grant+stream map |
+| OutputSize API | Done — no 8K probe alloc; macOS/X11/synthetic |
+| Frame diff + dirty boxes | Done (word FNV + H/V run merge) |
+| RAM XOR protect | Done (pure-Go hot path; C retained in tree) |
 | PII masking | PatternDetector + Luhn PANs + OCR/Vision (`-ocr`) |
 | WebRTC DataChannel | Done (chunked SSCH + pooled zlib) |
-| P2P without cloud SFU | Done (local hub; `/` help page + `/status`) |
+| P2P without cloud SFU | Done (local hub; `/` help + `/status`) |
 | Viewer UI | MJPEG `-preview` + PNG `-snapshot` |
-| FHD p99 &lt; 10ms | Best-effort; high-res auto `-block=128`; use `-scale=50` / `-compress=false` if needed |
+| Wire stats | `wire_bytes_*` + Mbit/s on send/recv/loopback |
+| FHD p99 &lt; 10ms | Done on synthetic FHD; high-res auto `-block=128` |
+| Doctor | `-mode=doctor` checks grabber + hub |
 | GPU / video encode | Not in v0 |
 
 **Preview URL:** `http://127.0.0.1:8090/` (recv). Hub `:8787` is signaling only.

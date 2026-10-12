@@ -1,32 +1,7 @@
-//go:build !cgo
-
 package engine
 
-// Pure-Go protect/diff (used when CGO_ENABLED=0 / gopls cross-analysis).
-
-func xorBuffer(buf []byte, key *uint64) {
-	k := *key
-	i := 0
-	for ; i+8 <= len(buf); i += 8 {
-		k = k*6364136223846793005 + 1
-		u := uint64(buf[i]) | uint64(buf[i+1])<<8 | uint64(buf[i+2])<<16 | uint64(buf[i+3])<<24 |
-			uint64(buf[i+4])<<32 | uint64(buf[i+5])<<40 | uint64(buf[i+6])<<48 | uint64(buf[i+7])<<56
-		u ^= k
-		buf[i] = byte(u)
-		buf[i+1] = byte(u >> 8)
-		buf[i+2] = byte(u >> 16)
-		buf[i+3] = byte(u >> 24)
-		buf[i+4] = byte(u >> 32)
-		buf[i+5] = byte(u >> 40)
-		buf[i+6] = byte(u >> 48)
-		buf[i+7] = byte(u >> 56)
-	}
-	for ; i < len(buf); i++ {
-		k = k*6364136223846793005 + 1
-		buf[i] ^= byte(k >> 56)
-	}
-	*key = k
-}
+// Hot-path hash/diff in pure Go — zero cgo stub allocs (TZ acceptance).
+// C implementations remain in native/protect.c for optional/tooling use.
 
 func blockHashes(bgra []byte, width, height, stride, blockSize int, out []uint64) {
 	bx := (width + blockSize - 1) / blockSize
@@ -103,18 +78,29 @@ func diffBlocks(curr, prev []uint64, blocksX, blocksY, blockSize, frameW, frameH
 			}
 		}
 	}
-	return count
+	wcount := 0
+	for i := 0; i < count; i++ {
+		x, y, w, h := outRects[i*4+0], outRects[i*4+1], outRects[i*4+2], outRects[i*4+3]
+		if wcount > 0 {
+			p := outRects[(wcount-1)*4:]
+			if p[0] == x && p[2] == w && p[1]+p[3] == y {
+				p[3] += h
+				continue
+			}
+		}
+		outRects[wcount*4+0] = x
+		outRects[wcount*4+1] = y
+		outRects[wcount*4+2] = w
+		outRects[wcount*4+3] = h
+		wcount++
+	}
+	return wcount
 }
 
-func fillBlack(bgra []byte, stride, x, y, w, h int) {
-	for row := y; row < y+h; row++ {
-		off := row*stride + x*4
-		for col := 0; col < w; col++ {
-			p := off + col*4
-			bgra[p+0] = 0
-			bgra[p+1] = 0
-			bgra[p+2] = 0
-			bgra[p+3] = 255
-		}
-	}
+func hashAndDiff(plain []byte, w, h, stride, blockSize int, curr, prev []uint64, havePrev, forceAll bool, outRects []uint16) int {
+	blockHashes(plain, w, h, stride, blockSize, curr)
+	bx := (w + blockSize - 1) / blockSize
+	by := (h + blockSize - 1) / blockSize
+	force := forceAll || !havePrev
+	return diffBlocks(curr, prev, bx, by, blockSize, w, h, outRects, force)
 }
