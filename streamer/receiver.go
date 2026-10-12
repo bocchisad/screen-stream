@@ -70,8 +70,14 @@ func (r *FrameReconstructor) ApplyUnpacked(u *Unpacked) error {
 	if w <= 0 || h <= 0 {
 		return fmt.Errorf("invalid geometry %dx%d", w, h)
 	}
+	if w*h > MaxFramePixels || w > 8192 || h > 8192 {
+		return fmt.Errorf("geometry exceeds cap: %dx%d", w, h)
+	}
 	stride := w * 4
 	need := stride * h
+	if need <= 0 {
+		return fmt.Errorf("invalid frame bytes")
+	}
 	if r.width != w || r.height != h || len(r.canvas) < need {
 		r.width, r.height, r.stride = w, h, stride
 		r.canvas = make([]byte, need)
@@ -146,13 +152,19 @@ func (r *FrameReconstructor) WritePNG(path string) error {
 }
 
 func blitBGRA(dst []byte, stride int, tile []byte, x, y, w, h int) error {
+	if w <= 0 || h <= 0 || x < 0 || y < 0 {
+		return fmt.Errorf("bad blit rect")
+	}
 	if w*h*4 != len(tile) {
 		return fmt.Errorf("tile size mismatch: %d != %d", len(tile), w*h*4)
+	}
+	if x+w > stride/4 {
+		return fmt.Errorf("blit x overflow")
 	}
 	for row := 0; row < h; row++ {
 		dstOff := (y+row)*stride + x*4
 		srcOff := row * w * 4
-		if dstOff+w*4 > len(dst) {
+		if dstOff < 0 || dstOff+w*4 > len(dst) {
 			return fmt.Errorf("blit out of bounds")
 		}
 		copy(dst[dstOff:dstOff+w*4], tile[srcOff:srcOff+w*4])

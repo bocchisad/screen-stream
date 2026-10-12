@@ -4,6 +4,7 @@
 #include "vision_ocr.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 int ss_vision_ocr(
     const uint8_t *bgra,
@@ -15,8 +16,11 @@ int ss_vision_ocr(
     int max_out
 ) {
     if (!bgra || !rects || !texts || width <= 0 || height <= 0 || max_out <= 0) return -1;
+    if (stride < width * 4) return -1;
+    if (height > 0 && (size_t)stride > SIZE_MAX / (size_t)height) return -1;
 
     size_t nbytes = (size_t)stride * (size_t)height;
+    if (nbytes > (64u * 1024u * 1024u)) return -1;
     CFDataRef data = CFDataCreate(kCFAllocatorDefault, bgra, (CFIndex)nbytes);
     if (!data) return -1;
 

@@ -36,11 +36,14 @@ func (v *VisionOCRBackend) ScanFrame(ctx context.Context, meta FrameMeta, bgra [
 	if stride == 0 {
 		stride = int(meta.Width) * 4
 	}
+	need := stride * int(meta.Height)
+	if need <= 0 || len(bgra) < need {
+		return nil, nil
+	}
 	max := v.MaxLines
 	if max <= 0 {
 		max = 64
 	}
-	// outs: x,y,w,h per line + text via side channel buffers
 	rects := make([]C.ss_ocr_rect, max)
 	texts := make([]*C.char, max)
 	n := int(C.ss_vision_ocr(

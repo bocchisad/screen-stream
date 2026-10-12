@@ -36,7 +36,8 @@ func main() {
 	snapshot := flag.String("snapshot", "", "write reconstructed PNG (recv/loopback)")
 	preview := flag.String("preview", "", "MJPEG preview listen addr for recv/loopback (e.g. 127.0.0.1:8090)")
 	exclude := flag.String("exclude", "", "macOS bundle IDs to exclude")
-	xorSeedFlag := flag.String("xor-seed", "", "protect seed (decimal or 0xHEX); else env SCREEN_STREAM_XOR_SEED")
+	xorSeedFlag := flag.String("xor-seed", "", "shared seed (decimal/0xHEX) for RAM XOR + wire AEAD; else env SCREEN_STREAM_XOR_SEED")
+	tokenFlag := flag.String("token", "", "auth token for hub/preview; else env SCREEN_STREAM_TOKEN")
 	// legacy alias
 	webrtcAlias := flag.Bool("webrtc", false, "alias for -mode=loopback")
 	flag.Parse()
@@ -56,41 +57,42 @@ func main() {
 	} else {
 		seed = engine.ResolveXORSeed(0)
 	}
+	token := streamer.ResolveAuthToken(*tokenFlag)
 
-	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  xor_seed=0x%X\n",
-		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, seed)
+	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  seed=0x%X  aead=chacha20poly1305  auth=%v\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, seed, token != "")
 
 	switch *mode {
 	case "hub":
-		runHub(*signalAddr)
+		runHub(*signalAddr, token)
 	case "doctor":
 		runDoctor(*signalAddr)
 	case "bench":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed, token: token,
 			transport: "local",
 		})
 	case "loopback":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed, token: token,
 			snapshot: *snapshot, preview: *preview, transport: "loopback",
 		})
 	case "send":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed, token: token,
 			transport: "send", signalURL: "http://" + *signalAddr,
 		})
 	case "recv":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: true, // recv does not capture
-			compress: *compress, seed: seed, snapshot: *snapshot, preview: *preview,
+			compress: *compress, seed: seed, token: token, snapshot: *snapshot, preview: *preview,
 			transport: "recv", signalURL: "http://" + *signalAddr,
 		})
 	default:
@@ -99,8 +101,9 @@ func main() {
 	}
 }
 
-func runHub(addr string) {
+func runHub(addr, token string) {
 	hub := streamer.NewHTTPSignalingHub()
+	hub.Token = token
 	url, err := hub.ListenAndServe(addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hub: %v\n", err)
@@ -115,9 +118,21 @@ func runHub(addr string) {
 		}
 	}
 	fmt.Printf("signaling hub listening on %s\n", url)
+	if !streamer.IsLoopbackAddr(addr) {
+		fmt.Fprintf(os.Stderr, "WARN: hub is NOT on loopback (%s) — prefer 127.0.0.1 + -token\n", addr)
+	}
+	if token == "" {
+		fmt.Fprintf(os.Stderr, "WARN: no -token / SCREEN_STREAM_TOKEN — signaling is open\n")
+	} else {
+		fmt.Println("auth: token required on /offer /answer /ice /status")
+	}
 	fmt.Println("keep this terminal open, then in TWO other terminals:")
-	fmt.Printf("  send: go run ./cmd/screen-stream -mode=send -signal=%s -synthetic=false -scale=75 -seconds=30\n", clientAddr)
-	fmt.Printf("  recv: go run ./cmd/screen-stream -mode=recv -signal=%s -seconds=30 -snapshot=/tmp/recv.png\n", clientAddr)
+	tok := ""
+	if token != "" {
+		tok = " -token=…"
+	}
+	fmt.Printf("  send: go run ./cmd/screen-stream -mode=send -signal=%s -synthetic=false -scale=75 -seconds=30%s\n", clientAddr, tok)
+	fmt.Printf("  recv: go run ./cmd/screen-stream -mode=recv -signal=%s -seconds=30 -preview=127.0.0.1:8090%s\n", clientAddr, tok)
 	select {}
 }
 
@@ -186,6 +201,7 @@ type sessionOpts struct {
 	seed                    uint64
 	snapshot                string
 	preview                 string // MJPEG listen addr
+	token                   string
 	transport               string // local | loopback | send | recv
 	signalURL               string
 }
@@ -212,7 +228,7 @@ func runSession(o sessionOpts) {
 
 	case "loopback":
 		rec = streamer.NewFrameReconstructor(o.seed)
-		prev := startPreview(o.preview)
+		prev := startPreview(o.preview, o.token)
 		if prev != nil {
 			defer prev.Close()
 		}
@@ -222,6 +238,7 @@ func runSession(o sessionOpts) {
 		rtc, rtcPeer, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
+			Seed:      o.seed,
 			OnPacket: func(b []byte) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
@@ -241,8 +258,8 @@ func runSession(o sessionOpts) {
 		fmt.Printf("webrtc: loopback (compress=%v)\n", o.compress)
 
 	case "send":
-		sig := streamer.NewHTTPSignalingClient(o.signalURL)
-		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{RingDepth: 4, Compress: o.compress})
+		sig := streamer.NewHTTPSignalingClientToken(o.signalURL, o.token)
+		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{RingDepth: 4, Compress: o.compress, Seed: o.seed})
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		if err := rtc.DialOfferer(dialCtx, sig); err != nil {
 			dialCancel()
@@ -260,15 +277,16 @@ func runSession(o sessionOpts) {
 
 	case "recv":
 		rec = streamer.NewFrameReconstructor(o.seed)
-		prev := startPreview(o.preview)
+		prev := startPreview(o.preview, o.token)
 		if prev != nil {
 			defer prev.Close()
 		}
 		var lastPrev time.Time
-		sig := streamer.NewHTTPSignalingClient(o.signalURL)
+		sig := streamer.NewHTTPSignalingClientToken(o.signalURL, o.token)
 		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
+			Seed:      o.seed,
 			OnPacket: func(b []byte) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
@@ -488,17 +506,24 @@ loop:
 	fmt.Println(streamer.DescribeHandoff())
 }
 
-func startPreview(addr string) *streamer.PreviewServer {
+func startPreview(addr, token string) *streamer.PreviewServer {
 	if addr == "" {
 		return nil
 	}
+	if !streamer.IsLoopbackAddr(addr) {
+		fmt.Fprintf(os.Stderr, "WARN: preview is NOT on loopback (%s)\n", addr)
+	}
+	if token == "" {
+		fmt.Fprintf(os.Stderr, "WARN: preview has no -token — anyone on the bind addr can watch\n")
+	}
 	p := streamer.NewPreviewServer(70)
+	p.Token = token
 	url, err := p.ListenAndServe(addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "preview: %v\n", err)
 		return nil
 	}
-	fmt.Printf("preview: %s  (open in browser)\n", url)
+	fmt.Printf("preview: %s\n", url)
 	return p
 }
 

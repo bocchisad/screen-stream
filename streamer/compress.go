@@ -3,6 +3,7 @@ package streamer
 import (
 	"bytes"
 	"compress/zlib"
+	"fmt"
 	"io"
 	"sync"
 
@@ -24,7 +25,6 @@ var (
 )
 
 // CompressPayload zlib-compresses pkt.Payload into its own capacity when smaller.
-// Skips tiny payloads (overhead not worth it). Reuses writer/buffer pools.
 func CompressPayload(pkt *engine.DirtyPacket) error {
 	if len(pkt.Payload) < 2048 || pkt.Flags&engine.FlagCompressed != 0 {
 		return nil
@@ -78,7 +78,7 @@ func CompressPayload(pkt *engine.DirtyPacket) error {
 	return nil
 }
 
-// DecompressPayload expands zlib payload when FlagCompressed is set.
+// DecompressPayload expands zlib payload when FlagCompressed is set (size-capped).
 func DecompressPayload(flags uint16, payload []byte) ([]byte, error) {
 	if flags&engine.FlagCompressed == 0 {
 		return payload, nil
@@ -88,16 +88,13 @@ func DecompressPayload(flags uint16, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	bp := zlibBufPool.Get().(*[]byte)
-	buf := bytes.NewBuffer((*bp)[:0])
-	_, err = io.Copy(buf, r)
+	lim := io.LimitReader(r, int64(MaxDecompressedPayload)+1)
+	out, err := io.ReadAll(lim)
 	if err != nil {
-		*bp = buf.Bytes()[:0]
-		zlibBufPool.Put(bp)
 		return nil, err
 	}
-	out := append([]byte(nil), buf.Bytes()...)
-	*bp = buf.Bytes()[:0]
-	zlibBufPool.Put(bp)
+	if len(out) > MaxDecompressedPayload {
+		return nil, fmt.Errorf("decompress: payload exceeds %d bytes", MaxDecompressedPayload)
+	}
 	return out, nil
 }

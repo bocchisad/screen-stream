@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -22,15 +23,17 @@ type iceBody struct {
 }
 
 // HTTPSignalingHub is a tiny local signaling server for two peers (no cloud).
+// Set Token for Bearer/?token= auth; empty token = open (dev). Prefer loopback bind.
 type HTTPSignalingHub struct {
 	mu        sync.Mutex
 	offer     string
 	answer    string
-	iceOffer  []ICECandidateJSON // offerer → answerer
-	iceAnswer []ICECandidateJSON // answerer → offerer
+	iceOffer  []ICECandidateJSON
+	iceAnswer []ICECandidateJSON
 	cond      *sync.Cond
 	srv       *http.Server
 	addr      string
+	Token     string
 }
 
 func NewHTTPSignalingHub() *HTTPSignalingHub {
@@ -43,25 +46,28 @@ func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", h.handleIndex)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
-	mux.HandleFunc("/status", h.handleStatus)
-	mux.HandleFunc("/offer", h.handleOffer)
-	mux.HandleFunc("/answer", h.handleAnswer)
-	mux.HandleFunc("/ice", h.handleICE)
-	// Prefer tcp4 so clients dialing 127.0.0.1 work (tcp on macOS often binds [::] only).
+	mux.HandleFunc("/status", requireToken(h.handleStatus, h.Token))
+	mux.HandleFunc("/offer", requireToken(h.handleOffer, h.Token))
+	mux.HandleFunc("/answer", requireToken(h.handleAnswer, h.Token))
+	mux.HandleFunc("/ice", requireToken(h.handleICE, h.Token))
 	network := "tcp4"
 	if len(addr) > 0 && addr[0] == '[' {
 		network = "tcp"
 	}
 	ln, err := net.Listen(network, addr)
 	if err != nil {
-		// Fallback if tcp4 unavailable.
 		ln, err = net.Listen("tcp", addr)
 		if err != nil {
 			return "", err
 		}
 	}
 	h.addr = ln.Addr().String()
-	h.srv = &http.Server{Handler: mux}
+	h.srv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Duration(MaxSignalingWaitSeconds+30) * time.Second,
+		WriteTimeout:      30 * time.Second,
+	}
 	go func() { _ = h.srv.Serve(ln) }()
 	return "http://" + h.addr, nil
 }
@@ -77,8 +83,9 @@ func (h *HTTPSignalingHub) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, `<!doctype html><title>screen-stream hub</title>
 <body style="font:14px/1.4 system-ui;max-width:40rem;margin:2rem;background:#111;color:#ddd">
 <h1>signaling hub</h1>
-<p>This is <b>not</b> the live preview. Preview is on recv: <code>http://127.0.0.1:8090/</code></p>
-<p>API: <a href="/status">/status</a> · <code>/offer</code> · <code>/answer</code> · <code>/ice</code> · <code>/health</code></p>
+<p>Bind to 127.0.0.1. Use <code>-token</code> / <code>SCREEN_STREAM_TOKEN</code> for auth.</p>
+<p>Preview: <code>http://127.0.0.1:8090/</code></p>
+<p>API: <a href="/status">/status</a> · <code>/offer</code> · <code>/answer</code> · <code>/ice</code></p>
 </body>`)
 }
 
@@ -111,16 +118,37 @@ func (h *HTTPSignalingHub) resetLocked() {
 	h.iceAnswer = nil
 }
 
+// waitCond waits until pred() or timeout; caller holds h.mu.
+func (h *HTTPSignalingHub) waitCond(pred func() bool, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for !pred() {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return false
+		}
+		timer := time.AfterFunc(left, func() {
+			h.mu.Lock()
+			h.cond.Broadcast()
+			h.mu.Unlock()
+		})
+		h.cond.Wait()
+		timer.Stop()
+		if !pred() && time.Now().After(deadline) {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var b sdpBody
-		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&b); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
 		h.mu.Lock()
-		// New offer starts a fresh session (drops stale answer/ICE from prior runs).
 		h.resetLocked()
 		h.offer = b.SDP
 		h.cond.Broadcast()
@@ -128,11 +156,13 @@ func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 	case http.MethodGet:
 		h.mu.Lock()
-		for h.offer == "" {
-			h.cond.Wait()
+		ok := h.waitCond(func() bool { return h.offer != "" }, time.Duration(MaxSignalingWaitSeconds)*time.Second)
+		if !ok {
+			h.mu.Unlock()
+			http.Error(w, "timeout waiting for offer", 504)
+			return
 		}
 		sdp := h.offer
-		// One-shot: consume offer so a late recv cannot bind to a dead sender.
 		h.offer = ""
 		h.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(sdpBody{SDP: sdp})
@@ -151,7 +181,7 @@ func (h *HTTPSignalingHub) handleAnswer(w http.ResponseWriter, r *http.Request) 
 	switch r.Method {
 	case http.MethodPost:
 		var b sdpBody
-		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&b); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
@@ -162,11 +192,14 @@ func (h *HTTPSignalingHub) handleAnswer(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(204)
 	case http.MethodGet:
 		h.mu.Lock()
-		for h.answer == "" {
-			h.cond.Wait()
+		ok := h.waitCond(func() bool { return h.answer != "" }, time.Duration(MaxSignalingWaitSeconds)*time.Second)
+		if !ok {
+			h.mu.Unlock()
+			http.Error(w, "timeout waiting for answer", 504)
+			return
 		}
 		sdp := h.answer
-		h.answer = "" // one-shot
+		h.answer = ""
 		h.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(sdpBody{SDP: sdp})
 	default:
@@ -178,56 +211,81 @@ func (h *HTTPSignalingHub) handleICE(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var b iceBody
-		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&b); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
 		h.mu.Lock()
 		if b.FromOfferer {
-			h.iceOffer = append(h.iceOffer, b.Candidate)
-		} else {
+			if len(h.iceOffer) < 256 {
+				h.iceOffer = append(h.iceOffer, b.Candidate)
+			}
+		} else if len(h.iceAnswer) < 256 {
 			h.iceAnswer = append(h.iceAnswer, b.Candidate)
 		}
 		h.cond.Broadcast()
 		h.mu.Unlock()
 		w.WriteHeader(204)
 	case http.MethodGet:
-		// ?from=offer → fetch candidates produced by offerer (for answerer)
 		from := r.URL.Query().Get("from")
 		wantOffer := from != "answer"
 		h.mu.Lock()
-		for {
-			if wantOffer && len(h.iceOffer) > 0 {
-				c := h.iceOffer[0]
-				h.iceOffer = h.iceOffer[1:]
-				h.mu.Unlock()
-				_ = json.NewEncoder(w).Encode(c)
-				return
+		ok := h.waitCond(func() bool {
+			if wantOffer {
+				return len(h.iceOffer) > 0
 			}
-			if !wantOffer && len(h.iceAnswer) > 0 {
-				c := h.iceAnswer[0]
-				h.iceAnswer = h.iceAnswer[1:]
-				h.mu.Unlock()
-				_ = json.NewEncoder(w).Encode(c)
-				return
-			}
-			h.cond.Wait()
+			return len(h.iceAnswer) > 0
+		}, time.Duration(MaxSignalingWaitSeconds)*time.Second)
+		if !ok {
+			h.mu.Unlock()
+			http.Error(w, "timeout waiting for ICE", 504)
+			return
 		}
+		var c ICECandidateJSON
+		if wantOffer {
+			c = h.iceOffer[0]
+			h.iceOffer = h.iceOffer[1:]
+		} else {
+			c = h.iceAnswer[0]
+			h.iceAnswer = h.iceAnswer[1:]
+		}
+		h.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(c)
 	default:
 		http.Error(w, "method", 405)
 	}
 }
 
+// IsLoopbackAddr reports whether host is a loopback bind/dial target.
+func IsLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(host, "[]")
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // HTTPSignalingClient implements Signaling against a hub base URL.
 type HTTPSignalingClient struct {
 	base   string
+	token  string
 	client *http.Client
 }
 
 func NewHTTPSignalingClient(baseURL string) *HTTPSignalingClient {
+	return NewHTTPSignalingClientToken(baseURL, "")
+}
+
+func NewHTTPSignalingClientToken(baseURL, token string) *HTTPSignalingClient {
 	return &HTTPSignalingClient{
 		base:   baseURL,
-		client: &http.Client{Timeout: 120 * time.Second},
+		token:  token,
+		client: &http.Client{Timeout: time.Duration(MaxSignalingWaitSeconds+30) * time.Second},
 	}
 }
 
@@ -249,7 +307,6 @@ func (c *HTTPSignalingClient) SendICE(fromOfferer bool, cand ICECandidateJSON) e
 }
 
 func (c *HTTPSignalingClient) RecvICE(ctx context.Context, fromOfferer bool) (ICECandidateJSON, error) {
-	// fromOfferer=true means we want candidates that came FROM the offerer.
 	q := "from=offer"
 	if !fromOfferer {
 		q = "from=answer"
@@ -258,11 +315,15 @@ func (c *HTTPSignalingClient) RecvICE(ctx context.Context, fromOfferer bool) (IC
 	if err != nil {
 		return ICECandidateJSON{}, err
 	}
+	c.setAuth(req)
 	res, err := c.client.Do(req)
 	if err != nil {
 		return ICECandidateJSON{}, err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == 504 {
+		return ICECandidateJSON{}, fmt.Errorf("signaling ICE timeout")
+	}
 	var cnd ICECandidateJSON
 	if err := json.NewDecoder(res.Body).Decode(&cnd); err != nil {
 		return ICECandidateJSON{}, err
@@ -270,15 +331,27 @@ func (c *HTTPSignalingClient) RecvICE(ctx context.Context, fromOfferer bool) (IC
 	return cnd, nil
 }
 
+func (c *HTTPSignalingClient) setAuth(req *http.Request) {
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+}
+
 func (c *HTTPSignalingClient) postJSON(path string, v any) error {
 	b, _ := json.Marshal(v)
-	res, err := c.client.Post(c.base+path, "application/json", bytes.NewReader(b))
+	req, err := http.NewRequest(http.MethodPost, c.base+path, bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
+	res, err := c.client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
-		body, _ := io.ReadAll(res.Body)
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		return fmt.Errorf("signaling %s: %s %s", path, res.Status, body)
 	}
 	return nil
@@ -289,11 +362,18 @@ func (c *HTTPSignalingClient) getSDP(ctx context.Context, path string) (string, 
 	if err != nil {
 		return "", err
 	}
+	c.setAuth(req)
 	res, err := c.client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer res.Body.Close()
+	if res.StatusCode == 401 {
+		return "", fmt.Errorf("signaling unauthorized (check -token)")
+	}
+	if res.StatusCode == 504 {
+		return "", fmt.Errorf("signaling %s timeout", path)
+	}
 	var b sdpBody
 	if err := json.NewDecoder(res.Body).Decode(&b); err != nil {
 		return "", err

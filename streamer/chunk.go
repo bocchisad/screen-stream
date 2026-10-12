@@ -14,10 +14,11 @@ const (
 
 // ChunkReassembler merges SSCH fragments into full DirtyPacket wire buffers.
 type ChunkReassembler struct {
-	mu      sync.Mutex
-	pending map[uint32]*partialMsg
-	onFull  func([]byte)
-	pool    sync.Pool
+	mu        sync.Mutex
+	pending   map[uint32]*partialMsg
+	onFull    func([]byte)
+	pool      sync.Pool
+	chunkSize int // must match sender SplitWire chunk size
 }
 
 type partialMsg struct {
@@ -29,12 +30,20 @@ type partialMsg struct {
 }
 
 func NewChunkReassembler(onFull func([]byte)) *ChunkReassembler {
+	return NewChunkReassemblerSize(onFull, DefaultChunkSize)
+}
+
+func NewChunkReassemblerSize(onFull func([]byte), chunkSize int) *ChunkReassembler {
+	if chunkSize <= 0 {
+		chunkSize = DefaultChunkSize
+	}
 	r := &ChunkReassembler{
-		pending: make(map[uint32]*partialMsg),
-		onFull:  onFull,
+		pending:   make(map[uint32]*partialMsg),
+		onFull:    onFull,
+		chunkSize: chunkSize,
 	}
 	r.pool.New = func() any {
-		b := make([]byte, 0, 4<<20)
+		b := make([]byte, 0, 1<<20)
 		return &b
 	}
 	return r
@@ -46,7 +55,9 @@ func (r *ChunkReassembler) Push(data []byte) {
 		r.pushChunk(data)
 		return
 	}
-	// Legacy / single-message DirtyPacket
+	if len(data) == 0 || len(data) > MaxWireMessage {
+		return
+	}
 	if r.onFull != nil {
 		out := make([]byte, len(data))
 		copy(out, data)
@@ -63,7 +74,13 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	count := int(binary.LittleEndian.Uint16(data[10:]))
 	total := int(binary.LittleEndian.Uint32(data[12:]))
 	payload := data[ChunkHeaderSize:]
-	if count <= 0 || index < 0 || index >= count || total <= 0 {
+	if count <= 0 || count > MaxChunkFragments || index < 0 || index >= count {
+		return
+	}
+	if total <= 0 || total > MaxWireMessage {
+		return
+	}
+	if len(payload) > r.chunkSize+1024 { // small slack for last chunk
 		return
 	}
 
@@ -71,7 +88,18 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	defer r.mu.Unlock()
 	pm, ok := r.pending[msgID]
 	if !ok {
+		if len(r.pending) >= MaxPendingChunks {
+			// Drop oldest arbitrary entry under flood.
+			for id, old := range r.pending {
+				r.releaseBuf(old.buf)
+				delete(r.pending, id)
+				break
+			}
+		}
 		buf := r.allocBuf(total)
+		if buf == nil {
+			return
+		}
 		pm = &partialMsg{
 			total:  total,
 			count:  count,
@@ -80,10 +108,12 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 		}
 		r.pending[msgID] = pm
 	} else if pm.total != total || pm.count != count {
-		// Conflicting fragment metadata — drop and restart.
 		r.releaseBuf(pm.buf)
 		delete(r.pending, msgID)
 		buf := r.allocBuf(total)
+		if buf == nil {
+			return
+		}
 		pm = &partialMsg{
 			total:  total,
 			count:  count,
@@ -95,16 +125,14 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	if pm.filled[index] {
 		return
 	}
-	// Chunks are sequential slices of the full message.
-	chunkSize := DefaultChunkSize
-	off := index * chunkSize
+	off := index * r.chunkSize
 	if off >= total {
 		return
 	}
-	n := copy(pm.buf[off:], payload)
-	if n != len(payload) && off+len(payload) > total {
+	if off+len(payload) > total {
 		return
 	}
+	copy(pm.buf[off:], payload)
 	pm.filled[index] = true
 	pm.got++
 	if pm.got < pm.count {
@@ -115,11 +143,13 @@ func (r *ChunkReassembler) pushChunk(data []byte) {
 	if r.onFull != nil {
 		r.onFull(full)
 	}
-	// Return backing store to pool after consumer returns (onFull must not retain).
 	r.releaseBuf(full)
 }
 
 func (r *ChunkReassembler) allocBuf(total int) []byte {
+	if total <= 0 || total > MaxWireMessage {
+		return nil
+	}
 	if bp, ok := r.pool.Get().(*[]byte); ok {
 		if cap(*bp) >= total {
 			return (*bp)[:total]
@@ -138,10 +168,12 @@ func (r *ChunkReassembler) releaseBuf(buf []byte) {
 }
 
 // SplitWire fragments a packed DirtyPacket into SSCH chunks.
-// scratch must be at least ChunkHeaderSize+chunkSize; reused across emits (emit must copy/send before return).
 func SplitWire(msgID uint32, wire []byte, chunkSize int, scratch []byte, emit func([]byte) error) error {
 	if chunkSize <= 0 {
 		chunkSize = DefaultChunkSize
+	}
+	if len(wire) > MaxWireMessage {
+		return ErrTruncated
 	}
 	need := ChunkHeaderSize + chunkSize
 	if cap(scratch) < need {
@@ -150,6 +182,9 @@ func SplitWire(msgID uint32, wire []byte, chunkSize int, scratch []byte, emit fu
 	count := 1
 	if len(wire) > chunkSize {
 		count = (len(wire) + chunkSize - 1) / chunkSize
+	}
+	if count > MaxChunkFragments {
+		return ErrTruncated
 	}
 	for i := 0; i < count; i++ {
 		start := i * chunkSize

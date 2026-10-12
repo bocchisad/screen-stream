@@ -12,14 +12,17 @@ import (
 )
 
 // PreviewServer serves a live MJPEG view of reconstructed frames (TZ viewer surface).
+// Unauthenticated — bind to loopback only.
 type PreviewServer struct {
-	mu      sync.Mutex
-	jpeg    []byte
-	seq     uint64
-	cond    *sync.Cond
-	srv     *http.Server
-	addr    string
-	quality int
+	mu       sync.Mutex
+	jpeg     []byte
+	seq      uint64
+	cond     *sync.Cond
+	srv      *http.Server
+	addr     string
+	quality  int
+	viewers  int
+	Token    string
 
 	rgba   *image.RGBA
 	jpgBuf bytes.Buffer
@@ -93,9 +96,9 @@ func (p *PreviewServer) UpdateFromBGRA(bgra []byte, width, height, stride int) e
 
 func (p *PreviewServer) ListenAndServe(addr string) (string, error) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", p.handleIndex)
-	mux.HandleFunc("/stream", p.handleStream)
-	mux.HandleFunc("/frame.jpg", p.handleFrame)
+	mux.HandleFunc("/", requireToken(p.handleIndex, p.Token))
+	mux.HandleFunc("/stream", requireToken(p.handleStream, p.Token))
+	mux.HandleFunc("/frame.jpg", requireToken(p.handleFrame, p.Token))
 	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		ln, err = net.Listen("tcp", addr)
@@ -104,9 +107,13 @@ func (p *PreviewServer) ListenAndServe(addr string) (string, error) {
 		}
 	}
 	p.addr = ln.Addr().String()
-	p.srv = &http.Server{Handler: mux}
+	p.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = p.srv.Serve(ln) }()
-	return "http://" + p.addr, nil
+	url := "http://" + p.addr
+	if p.Token != "" {
+		url += "/?token=" + p.Token
+	}
+	return url, nil
 }
 
 func (p *PreviewServer) Close() error {
@@ -119,12 +126,17 @@ func (p *PreviewServer) Close() error {
 	return p.srv.Close()
 }
 
-func (p *PreviewServer) handleIndex(w http.ResponseWriter, _ *http.Request) {
+func (p *PreviewServer) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	src := "/stream"
+	if p.Token != "" {
+		src = "/stream?token=" + p.Token
+	}
 	_, _ = fmt.Fprintf(w, `<!doctype html><title>screen-stream preview</title>
 <body style="margin:0;background:#111;display:flex;justify-content:center;align-items:center;height:100vh">
-<img src="/stream" alt="live" style="max-width:100%%;max-height:100%%;object-fit:contain"/>
-</body>`)
+<img src="%s" alt="live" style="max-width:100%%;max-height:100%%;object-fit:contain"/>
+</body>`, src)
+	_ = r
 }
 
 func (p *PreviewServer) handleFrame(w http.ResponseWriter, _ *http.Request) {
@@ -146,6 +158,21 @@ func (p *PreviewServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no flush", 500)
 		return
 	}
+	p.mu.Lock()
+	if p.viewers >= MaxPreviewClients {
+		p.mu.Unlock()
+		http.Error(w, "too many viewers", 503)
+		return
+	}
+	p.viewers++
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.viewers--
+		p.cond.Broadcast()
+		p.mu.Unlock()
+	}()
+
 	w.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary=frame")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "close")

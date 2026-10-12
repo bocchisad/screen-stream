@@ -119,8 +119,14 @@ func Unpack(src []byte) (*Unpacked, error) {
 	o += 2
 	rc := int(binary.LittleEndian.Uint16(src[o:]))
 	o += 2
+	if rc > MaxRegionCount {
+		return nil, ErrTruncated
+	}
 	need := headerSize + rc*regionSize
 	if len(src) < need {
+		return nil, ErrTruncated
+	}
+	if len(src) > MaxWireMessage {
 		return nil, ErrTruncated
 	}
 	u.Regions = make([]engine.DirtyRegion, rc)

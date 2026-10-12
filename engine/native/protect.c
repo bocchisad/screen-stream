@@ -6,8 +6,10 @@ void ss_xor_buffer(uint8_t *buf, size_t len, uint64_t *key_state) {
     size_t i = 0;
     for (; i + 8 <= len; i += 8) {
         k = k * 6364136223846793005ULL + 1ULL;
-        uint64_t *p = (uint64_t *)(buf + i);
-        *p ^= k;
+        uint64_t w;
+        memcpy(&w, buf + i, 8); /* avoid unaligned UB */
+        w ^= k;
+        memcpy(buf + i, &w, 8);
     }
     for (; i < len; i++) {
         k = k * 6364136223846793005ULL + 1ULL;
@@ -110,8 +112,10 @@ int ss_diff_blocks(
         uint16_t h = out_rects[i * 4 + 3];
         if (wcount > 0) {
             uint16_t *p = &out_rects[(wcount - 1) * 4];
-            if (p[0] == x && p[2] == w && p[1] + p[3] == y) {
-                p[3] = (uint16_t)(p[3] + h);
+            if (p[0] == x && p[2] == w && (int)p[1] + (int)p[3] == (int)y) {
+                int nh = (int)p[3] + (int)h;
+                if (nh > 65535) nh = 65535;
+                p[3] = (uint16_t)nh;
                 continue;
             }
         }
@@ -122,6 +126,7 @@ int ss_diff_blocks(
 }
 
 void ss_fill_black(uint8_t *bgra, int stride, int x, int y, int w, int h) {
+    if (!bgra || stride <= 0 || w <= 0 || h <= 0 || x < 0 || y < 0) return;
     for (int row = y; row < y + h; row++) {
         uint8_t *p = bgra + (size_t)row * (size_t)stride + (size_t)x * 4;
         for (int col = 0; col < w; col++) {

@@ -2,6 +2,7 @@ package streamer
 
 import (
 	"context"
+	"crypto/cipher"
 	"fmt"
 	"io"
 	"sync"
@@ -38,14 +39,19 @@ type WebRTCSession struct {
 	compress  bool
 	chunkSize int
 	reasm     *ChunkReassembler
+	aead      cipher.AEAD
+	aeadBuf   []byte
+	seed      uint64
 }
 
 type SessionConfig struct {
 	RingDepth int
 	Label     string
-	OnPacket  func([]byte) // inbound full DirtyPacket wire (after reassembly)
+	OnPacket  func([]byte) // inbound DirtyPacket wire after reassembly (+ AEAD open)
 	Compress  bool         // zlib payload before send
 	ChunkSize int          // 0 → DefaultChunkSize
+	Seed      uint64       // shared seed → wire AEAD key (0 → DefaultXORSeed)
+	DisableAEAD bool       // test-only: send plaintext DirtyPackets
 }
 
 func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
@@ -58,24 +64,39 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = DefaultChunkSize
 	}
+	if cfg.Seed == 0 {
+		cfg.Seed = engine.DefaultXORSeed
+	}
 	s := &WebRTCSession{
 		ring:      engine.NewDeliveryRing(cfg.RingDepth),
 		label:     cfg.Label,
 		onPacket:  cfg.OnPacket,
 		compress:  cfg.Compress,
 		chunkSize: cfg.ChunkSize,
+		seed:      cfg.Seed,
 		packBuf:   make([]byte, 0, 8<<20),
 		chunkBuf:  make([]byte, ChunkHeaderSize+DefaultChunkSize),
 		sendCopy:  make([]byte, ChunkHeaderSize+DefaultChunkSize),
+		aeadBuf:   make([]byte, 0, 8<<20),
 		dcOpen:    make(chan struct{}),
 	}
-	s.reasm = NewChunkReassembler(func(full []byte) {
+	if !cfg.DisableAEAD {
+		aead, err := NewWireAEAD(cfg.Seed)
+		if err == nil {
+			s.aead = aead
+		}
+	}
+	s.reasm = NewChunkReassemblerSize(func(full []byte) {
 		s.recv.Add(1)
 		s.bytesRecv.Add(uint64(len(full)))
-		if s.onPacket != nil {
-			s.onPacket(full)
+		plain, err := OpenWire(s.aead, full)
+		if err != nil {
+			return
 		}
-	})
+		if s.onPacket != nil {
+			s.onPacket(plain)
+		}
+	}, s.chunkSize)
 	return s
 }
 
@@ -289,9 +310,18 @@ func (s *WebRTCSession) sendPacket(pkt *engine.DirtyPacket) {
 	if _, err := PackInto(pkt, buf); err != nil {
 		return
 	}
+	wire := buf
+	if s.aead != nil {
+		sealed, err := SealWire(s.aead, buf, s.aeadBuf)
+		if err != nil {
+			return
+		}
+		s.aeadBuf = sealed
+		wire = sealed
+	}
 	id := NextMsgID()
 	var wireBytes int
-	_ = SplitWire(id, buf, s.chunkSize, s.chunkBuf, func(chunk []byte) error {
+	_ = SplitWire(id, wire, s.chunkSize, s.chunkBuf, func(chunk []byte) error {
 		if cap(s.sendCopy) < len(chunk) {
 			s.sendCopy = make([]byte, len(chunk))
 		}

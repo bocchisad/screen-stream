@@ -83,8 +83,12 @@ func diffBlocks(curr, prev []uint64, blocksX, blocksY, blockSize, frameW, frameH
 		x, y, w, h := outRects[i*4+0], outRects[i*4+1], outRects[i*4+2], outRects[i*4+3]
 		if wcount > 0 {
 			p := outRects[(wcount-1)*4:]
-			if p[0] == x && p[2] == w && p[1]+p[3] == y {
-				p[3] += h
+			if p[0] == x && p[2] == w && int(p[1])+int(p[3]) == int(y) {
+				nh := int(p[3]) + int(h)
+				if nh > 65535 {
+					nh = 65535
+				}
+				p[3] = uint16(nh)
 				continue
 			}
 		}

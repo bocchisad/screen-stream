@@ -7,7 +7,8 @@ import (
 	"strings"
 )
 
-// DefaultXORSeed is the shared stream protect seed (override via env / CLI).
+// DefaultXORSeed is a public demo seed (NOT a secret). Override via env / CLI.
+// XOR protect is obfuscation against casual dumps — not cryptographic confidentiality.
 const DefaultXORSeed uint64 = 0xC0FFEE42D00D
 
 // EnvXORSeedKey is read by ResolveXORSeed when CLI seed is 0.

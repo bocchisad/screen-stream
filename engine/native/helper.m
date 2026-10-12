@@ -9,6 +9,8 @@
 #include "helper.h"
 #include <string.h>
 #include <stdatomic.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 static void ss_native_size(SCDisplay *display, int *outW, int *outH) {
     CGDirectDisplayID did = display.displayID;
@@ -68,13 +70,22 @@ static atomic_int gFrameReady = 0;
     size_t h = CVPixelBufferGetHeight(imageBuffer);
     size_t stride = CVPixelBufferGetBytesPerRow(imageBuffer);
     void *base = CVPixelBufferGetBaseAddress(imageBuffer);
+    if (w == 0 || h == 0 || stride == 0 || stride > (SIZE_MAX / h)) {
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return;
+    }
     size_t need = stride * h;
+    /* Cap ~64 MiB single frame */
+    if (need > (64u * 1024u * 1024u)) {
+        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+        return;
+    }
 
     [self.lock lock];
     if (!self.latest || self.latestLen < need) {
         free(self.latest);
         self.latest = (uint8_t *)malloc(need);
-        self.latestLen = need;
+        self.latestLen = self.latest ? need : 0;
     }
     if (self.latest && base) {
         memcpy(self.latest, base, need);
@@ -85,6 +96,14 @@ static atomic_int gFrameReady = 0;
     }
     [self.lock unlock];
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+}
+
+- (void)dealloc {
+    [_lock lock];
+    free(_latest);
+    _latest = NULL;
+    _latestLen = 0;
+    [_lock unlock];
 }
 
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -247,20 +266,30 @@ int ss_mac_stop(void) {
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
     gStream = nil;
+    /* ARC dealloc frees latest via -dealloc */
     gDelegate = nil;
     gOutW = gOutH = gOutStride = 0;
+    atomic_store(&gFrameReady, 0);
     return 0;
 }
 
 int ss_mac_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
-    if (!gDelegate || !dst || !info) return 3;
+    if (!gDelegate || !dst || !info || dst_len <= 0) return 3;
     if (!atomic_load(&gFrameReady)) return 4;
     [gDelegate.lock lock];
     int w = gDelegate.width;
     int h = gDelegate.height;
     int stride = gDelegate.stride;
+    if (w <= 0 || h <= 0 || stride <= 0) {
+        [gDelegate.lock unlock];
+        return 3;
+    }
+    if ((size_t)stride > SIZE_MAX / (size_t)h) {
+        [gDelegate.lock unlock];
+        return 3;
+    }
     size_t need = (size_t)stride * (size_t)h;
-    if ((int)need > dst_len || !gDelegate.latest) {
+    if (need > (size_t)dst_len || !gDelegate.latest) {
         [gDelegate.lock unlock];
         return 3;
     }

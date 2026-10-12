@@ -17,6 +17,7 @@ func TestWebRTCLoopback(t *testing.T) {
 	rec := NewFrameReconstructor(engine.DefaultXORSeed)
 	sender, receiver, err := ConnectLoopbackOpts(ctx, SessionConfig{
 		Compress: true,
+		Seed:     engine.DefaultXORSeed,
 		OnPacket: func(b []byte) {
 			_ = rec.Apply(b)
 			got.Add(1)
@@ -72,6 +73,7 @@ func TestWebRTCHighResChunked(t *testing.T) {
 	sender, receiver, err := ConnectLoopbackOpts(ctx, SessionConfig{
 		Compress:  true,
 		ChunkSize: DefaultChunkSize,
+		Seed:      engine.DefaultXORSeed,
 		OnPacket: func(b []byte) {
 			if err := rec.Apply(b); err == nil {
 				got.Add(1)
