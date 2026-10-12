@@ -57,11 +57,18 @@ func TestPipelinePIIPixelScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pkt.Release()
-	// Plain scratch wiped.
-	for _, b := range p.plain {
-		if b != 0 {
-			t.Fatal("plaintext scratch not cleared")
+	if !fr.Protected {
+		t.Fatal("frame should be XOR-protected after Process")
+	}
+	// Capture buffer must not retain clear BGRA (in-place wipe).
+	same := 0
+	for i := range buf {
+		if fr.Pixels[i] == buf[i] {
+			same++
 		}
+	}
+	if same == len(buf) {
+		t.Fatal("frame pixels still match clear paint after protect")
 	}
 	// Redacted tiles: secret region should be black in packed payload after XOR-open —
 	// check via re-detect on a fresh buffer that still has the paint without Process wipe.

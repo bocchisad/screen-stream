@@ -17,7 +17,6 @@ type StreamPipeline struct {
 	havePrev    bool
 	frameCount  uint64
 	keyEvery    uint64
-	plain       []byte
 	width       int
 	height      int
 	stride      int
@@ -51,8 +50,8 @@ func NewPipeline(cfg PipelineConfig) *StreamPipeline {
 	bx := (cfg.Width + cfg.BlockSize - 1) / cfg.BlockSize
 	by := (cfg.Height + cfg.BlockSize - 1) / cfg.BlockSize
 	nBlocks := bx * by
-	// Payload tiles are tightly packed (w*h*4); working buffers need full stride.
-	frameBytes := cfg.Stride * cfg.Height
+	// Payload tiles are tightly packed (w*h*4). Process works in-place on frame.Pixels
+	// (no full-frame scratch copy).
 	tileBytes := cfg.Width * cfg.Height * 4
 	return &StreamPipeline{
 		blockSize:   cfg.BlockSize,
@@ -62,7 +61,6 @@ func NewPipeline(cfg PipelineConfig) *StreamPipeline {
 		currHashes:  make([]uint64, nBlocks),
 		rectScratch: make([]uint16, nBlocks*4),
 		keyEvery:    cfg.KeyEvery,
-		plain:       make([]byte, frameBytes),
 		width:       cfg.Width,
 		height:      cfg.Height,
 		stride:      cfg.Stride,
@@ -85,27 +83,23 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 		stride = w * 4
 	}
 	need := stride * h
-	if len(frame.Pixels) < need || len(p.plain) < need {
+	if len(frame.Pixels) < need {
 		return nil, ErrBufferTooSmall
 	}
-
-	copy(p.plain[:need], frame.Pixels[:need])
+	pix := frame.Pixels[:need]
 	fk := frameKey(p.seed, meta.FrameID)
-	k := fk
-	xorBuffer(frame.Pixels[:need], &k)
-	frame.Protected = true
 
 	p.frameCount++
 	force := !p.havePrev || (p.frameCount%p.keyEvery == 0)
-	n := hashAndDiff(p.plain[:need], w, h, stride, p.blockSize,
+	n := hashAndDiff(pix, w, h, stride, p.blockSize,
 		p.currHashes, p.prevHashes, p.havePrev, force, p.rectScratch)
 
 	if p.detector != nil {
 		meta.BlockSize = uint16(p.blockSize)
-		rects, err := p.detector.Detect(ctx, meta, p.plain[:need])
+		rects, err := p.detector.Detect(ctx, meta, pix)
 		if err == nil {
 			for _, r := range rects {
-				fillBlack(p.plain, stride, int(r.X), int(r.Y), int(r.W), int(r.H))
+				fillBlack(pix, stride, int(r.X), int(r.Y), int(r.W), int(r.H))
 			}
 		}
 	}
@@ -137,7 +131,7 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 			break
 		}
 		dst := pkt.Payload[:payloadCap][payloadLen : payloadLen+tileBytes]
-		extractTileInto(p.plain, stride, x, y, rw, rh, dst)
+		extractTileInto(pix, stride, x, y, rw, rh, dst)
 		tk := fk ^ (uint64(x)<<32 | uint64(y))
 		xorBuffer(dst, &tk)
 		regions = regions[:len(regions)+1]
@@ -151,8 +145,10 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 	pkt.Regions = regions
 	pkt.Payload = pkt.Payload[:payloadLen]
 
-	// Wipe plaintext scratch so clear BGRA does not rest in RAM.
-	clear(p.plain[:need])
+	// Wipe capture buffer in place (no separate plaintext scratch).
+	k := fk
+	xorBuffer(pix, &k)
+	frame.Protected = true
 
 	copy(p.prevHashes, p.currHashes)
 	p.havePrev = true

@@ -47,8 +47,11 @@ func (g *linuxGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 	if cfg.FPS <= 0 {
 		g.cfg.FPS = 60
 	}
-	// gpu-surface on Linux: prefer PipeWire DMA path when available; same OS visibility.
-	_ = cfg.Mode
+	mode := 0
+	if cfg.Mode == CaptureGPUSurface {
+		mode = 1
+	}
+	C.ss_pw_set_capture_mode(C.int(mode))
 
 	wayland := int(C.ss_wayland_session()) == 1 ||
 		strings.EqualFold(os.Getenv("XDG_SESSION_TYPE"), "wayland")
@@ -65,6 +68,7 @@ func (g *linuxGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 	}
 
 	if int(C.ss_x11_available()) == 1 {
+		// X11 has no IOSurface-style retain; gpu-surface flag is a no-op on this path.
 		rc := int(C.ss_x11_start(C.int(cfg.DisplayIndex)))
 		if rc == 0 {
 			g.backend = "x11-shm"

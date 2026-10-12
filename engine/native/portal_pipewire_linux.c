@@ -74,6 +74,53 @@ static size_t gFrameCap = 0;
 static size_t gFrameLen = 0;
 static int gFrameReady = 0;
 static int gFormat = SPA_VIDEO_FORMAT_BGRA;
+/* 0 = cpu: memcpy PW→gFrameBGRA then capture memcpy→dst; 1 = hold mapped buf, one copy→dst */
+static int gCaptureMode = 0;
+static struct pw_buffer *gHeldBuf = NULL;
+static const uint8_t *gHeldData = NULL;
+static size_t gHeldSize = 0;
+
+static void release_held_locked(void) {
+    if (gHeldBuf && gStream) {
+        pw_stream_queue_buffer(gStream, gHeldBuf);
+    }
+    gHeldBuf = NULL;
+    gHeldData = NULL;
+    gHeldSize = 0;
+}
+
+/* Copy/convert SPA raw pixels into tightly packed BGRA dst (need = w*h*4). */
+static void copy_spa_to_bgra(uint8_t *dst, size_t need, const uint8_t *src, size_t src_sz, int format) {
+    if (!dst || !src || need == 0) return;
+    if (format == SPA_VIDEO_FORMAT_BGRA || format == SPA_VIDEO_FORMAT_BGRx) {
+        size_t n = src_sz < need ? src_sz : need;
+        memcpy(dst, src, n);
+        if (n < need) memset(dst + n, 0, need - n);
+    } else if (format == SPA_VIDEO_FORMAT_RGBA || format == SPA_VIDEO_FORMAT_RGBx) {
+        size_t px = need / 4;
+        size_t avail = src_sz / 4;
+        if (avail < px) px = avail;
+        for (size_t i = 0; i < px; i++) {
+            dst[i * 4 + 0] = src[i * 4 + 2];
+            dst[i * 4 + 1] = src[i * 4 + 1];
+            dst[i * 4 + 2] = src[i * 4 + 0];
+            dst[i * 4 + 3] = 255;
+        }
+        if (px * 4 < need) memset(dst + px * 4, 0, need - px * 4);
+    } else {
+        memset(dst, 0, need);
+    }
+}
+
+int ss_pw_set_capture_mode(int mode) {
+    pthread_mutex_lock(&gFrameMu);
+    gCaptureMode = (mode == 1) ? 1 : 0;
+    if (gCaptureMode == 0) {
+        release_held_locked();
+    }
+    pthread_mutex_unlock(&gFrameMu);
+    return 0;
+}
 
 typedef struct {
     GMainLoop *loop;
@@ -326,6 +373,17 @@ static void on_stream_process(void *data) {
     }
 
     pthread_mutex_lock(&gFrameMu);
+    if (gCaptureMode == 1) {
+        /* gpu-surface: retain mapped PW buffer; one copy happens in ss_pw_capture. */
+        release_held_locked();
+        gHeldBuf = b;
+        gHeldData = (const uint8_t *)d->data;
+        gHeldSize = d->chunk->size;
+        gFrameLen = need;
+        gFrameReady = 1;
+        pthread_mutex_unlock(&gFrameMu);
+        return; /* do not queue until next frame or stop */
+    }
     if (gFrameCap < need) {
         uint8_t *nb = (uint8_t *)realloc(gFrameBGRA, need);
         if (nb) {
@@ -334,26 +392,7 @@ static void on_stream_process(void *data) {
         }
     }
     if (gFrameBGRA && gFrameCap >= need) {
-        const uint8_t *src = (const uint8_t *)d->data;
-        size_t src_sz = d->chunk->size;
-        if (gFormat == SPA_VIDEO_FORMAT_BGRA || gFormat == SPA_VIDEO_FORMAT_BGRx) {
-            size_t n = src_sz < need ? src_sz : need;
-            memcpy(gFrameBGRA, src, n);
-            if (n < need) memset(gFrameBGRA + n, 0, need - n);
-        } else if (gFormat == SPA_VIDEO_FORMAT_RGBA || gFormat == SPA_VIDEO_FORMAT_RGBx) {
-            size_t px = need / 4;
-            size_t avail = src_sz / 4;
-            if (avail < px) px = avail;
-            for (size_t i = 0; i < px; i++) {
-                gFrameBGRA[i * 4 + 0] = src[i * 4 + 2];
-                gFrameBGRA[i * 4 + 1] = src[i * 4 + 1];
-                gFrameBGRA[i * 4 + 2] = src[i * 4 + 0];
-                gFrameBGRA[i * 4 + 3] = 255;
-            }
-        } else {
-            /* Unsupported → black */
-            memset(gFrameBGRA, 0, need);
-        }
+        copy_spa_to_bgra(gFrameBGRA, need, (const uint8_t *)d->data, d->chunk->size, gFormat);
         gFrameLen = need;
         gFrameReady = 1;
     }
@@ -509,6 +548,7 @@ int ss_pw_stop(void) {
         gConn = NULL;
     }
     pthread_mutex_lock(&gFrameMu);
+    release_held_locked();
     free(gFrameBGRA);
     gFrameBGRA = NULL;
     gFrameCap = gFrameLen = 0;
@@ -524,7 +564,7 @@ int ss_pw_stop(void) {
 int ss_pw_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
     if (gState != PW_STATE_STREAMING || !dst || !info) return 3;
     pthread_mutex_lock(&gFrameMu);
-    if (!gFrameReady || !gFrameBGRA || gFrameLen == 0) {
+    if (!gFrameReady || gFrameLen == 0) {
         pthread_mutex_unlock(&gFrameMu);
         return 4; /* no new frame */
     }
@@ -532,7 +572,20 @@ int ss_pw_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
         pthread_mutex_unlock(&gFrameMu);
         return 3;
     }
-    memcpy(dst, gFrameBGRA, gFrameLen);
+    if (gCaptureMode == 1) {
+        if (!gHeldData) {
+            pthread_mutex_unlock(&gFrameMu);
+            return 4;
+        }
+        copy_spa_to_bgra(dst, gFrameLen, gHeldData, gHeldSize, gFormat);
+        /* keep held until next process replaces it (same as mac CVPixelBuffer retain) */
+    } else {
+        if (!gFrameBGRA) {
+            pthread_mutex_unlock(&gFrameMu);
+            return 4;
+        }
+        memcpy(dst, gFrameBGRA, gFrameLen);
+    }
     info->width = gWidth;
     info->height = gHeight;
     info->stride = gWidth * 4;
@@ -560,6 +613,11 @@ int ss_pw_last_error(char *buf, int buflen) {
 }
 
 #else
+
+int ss_pw_set_capture_mode(int mode) {
+    (void)mode;
+    return 0;
+}
 
 int ss_pw_start(int fps) {
     if (fps > 0) gFPS = fps;

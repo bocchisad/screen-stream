@@ -188,6 +188,12 @@ func runDoctor(signalAddr, token string) {
 	fmt.Printf("  auth env %s set=%v\n", streamer.EnvAuthToken, token != "")
 	fmt.Printf("  ocr_available=%v  tesseract_available=%v  pipewire_builtin=%v\n",
 		engine.OCRAvailable(), engine.TesseractAvailable(), engine.PipeWireBuiltIn())
+	if runtime.GOOS == "linux" && !engine.PipeWireBuiltIn() {
+		fmt.Println("  pipewire hint: rebuild without -tags nopipewire; need libpipewire + gio (pkg-config)")
+	} else if runtime.GOOS == "linux" {
+		fmt.Println("  pipewire: linked (opt out: go build -tags nopipewire)")
+	}
+	fmt.Println("  capture staging: -capture=cpu|gpu-surface (gpu-surface = one-copy retain; SCK/PipeWire)")
 
 	g := engine.NewGrabber()
 	fmt.Printf("  grabber backend=%s\n", g.Backend())

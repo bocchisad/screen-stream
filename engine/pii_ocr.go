@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // OCRBackend is a pluggable on-device text detector (Vision / Tesseract / stub).
@@ -17,12 +18,17 @@ type OCRLine struct {
 	Rect Rect
 }
 
+// DefaultAsyncOCRTimeout caps background OCR so a hung backend cannot pin frames forever.
+const DefaultAsyncOCRTimeout = 2 * time.Second
+
 // OCRDetector: frame 1 sync (same-frame glyphs); later frames async. PixelScan always on.
 type OCRDetector struct {
 	Patterns  *PatternDetector
 	Backend   OCRBackend
 	Every     uint64
 	SyncFirst bool
+	// AsyncTimeout for background scans (0 → DefaultAsyncOCRTimeout).
+	AsyncTimeout time.Duration
 
 	frameN atomic.Uint64
 	busy   atomic.Bool
@@ -36,11 +42,12 @@ func NewOCRDetector(backend OCRBackend) *OCRDetector {
 	pd := NewPatternDetector()
 	pd.PixelScan = true
 	return &OCRDetector{
-		Patterns:  pd,
-		Backend:   backend,
-		Every:     3,
-		SyncFirst: true,
-		hits:      make([]Rect, 0, 32),
+		Patterns:     pd,
+		Backend:      backend,
+		Every:        3,
+		SyncFirst:    true,
+		AsyncTimeout: DefaultAsyncOCRTimeout,
+		hits:         make([]Rect, 0, 32),
 	}
 }
 
@@ -71,17 +78,21 @@ func (d *OCRDetector) kickAsync(ctx context.Context, meta FrameMeta, bgra []byte
 	metaCopy := meta
 	d.mu.Unlock()
 
+	// Detach from Process/capture deadline so a short parent ctx cannot abort OCR mid-scan.
+	base := context.WithoutCancel(ctx)
+	timeout := d.AsyncTimeout
+	if timeout <= 0 {
+		timeout = DefaultAsyncOCRTimeout
+	}
+	octx, cancel := context.WithTimeout(base, timeout)
+
 	go func() {
+		defer cancel()
 		defer func() {
 			clear(snap)
 			d.busy.Store(false)
 		}()
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		d.scanApply(ctx, metaCopy, snap)
+		d.scanApply(octx, metaCopy, snap)
 	}()
 }
 

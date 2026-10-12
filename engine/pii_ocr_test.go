@@ -55,3 +55,33 @@ func TestOCRDetectorStubNoOp(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestOCRAsyncSurvivesParentCancel(t *testing.T) {
+	fake := &fakeOCR{lines: []OCRLine{{
+		Text: "api_key=secretvalue123",
+		Rect: Rect{X: 0, Y: 0, W: 80, H: 16},
+	}}}
+	d := NewOCRDetector(fake)
+	d.SyncFirst = false
+	d.Every = 1
+	bgra := make([]byte, 16*16*4)
+	meta := FrameMeta{Width: 16, Height: 16, Stride: 64, BlockSize: 16}
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := d.Detect(ctx, meta, bgra)
+	cancel() // parent returns; async must still finish via WithoutCancel
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if fake.calls.Load() >= 1 && !d.busy.Load() {
+			hits := d.Patterns.DetectInto(nil)
+			if len(hits) == 0 {
+				t.Fatal("expected async hits after parent cancel")
+			}
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("async OCR did not finish after parent cancel; calls=%d", fake.calls.Load())
+}

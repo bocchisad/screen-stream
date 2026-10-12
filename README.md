@@ -33,7 +33,7 @@ go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
 
 **Flags:**
 - `-mode=cli` — interactive terminal menu
-- `-capture=cpu|gpu-surface` — staging path (`gpu-surface` = retain CVPixelBuffer, one copy; still SCK/PipeWire, experimental)
+- `-capture=cpu|gpu-surface` — staging path (`gpu-surface` = retain surface/buffer, one copy into Go; still SCK/PipeWire, experimental)
 - `-stun=stun:host:port` — optional ICE STUN (no TURN/SFU)
 - `-peer` / `-peers` — hub slot(s) for multi-viewer
 - `-expect-fingerprint=HEX` — fail if ECDH transcript mismatches
@@ -41,9 +41,13 @@ go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
 
 Hub `/status` includes `uptimeSec`, `peers`, and last POST `/metrics` counters.
 
+**Linux PipeWire:** default build links via pkg-config when libs exist. Without libpipewire/gio use `go build -tags nopipewire` (X11 path only). `doctor` prints `pipewire_builtin=`.
+
 ## Capture source
 
 OS screen recording APIs → CPU BGRA (not raw GPU VRAM). See [GPU notes](docs/superpowers/specs/2026-10-12-gpu-vram-capture-notes.md).
+
+`gpu-surface`: macOS retains `CVPixelBuffer`; Linux PipeWire holds the mapped buffer and copies once into the Go dst (skips intermediate staging). Still the same OS screen APIs — not foreign VRAM.
 
 ## Specs / plan
 
