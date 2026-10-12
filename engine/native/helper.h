@@ -33,6 +33,8 @@ int ss_mac_output_size(int *out_w, int *out_h, int *out_stride);
 int ss_mac_capture(uint8_t *dst, int dst_len, ss_frame_info *info);
 
 int ss_mac_set_exclude_bundle(const char *bundle_id);
+int ss_mac_set_exclude_window(uint32_t window_id);
+int ss_mac_clear_excludes(void);
 
 #ifdef __cplusplus
 }

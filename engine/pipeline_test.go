@@ -39,6 +39,38 @@ func TestPatternScan(t *testing.T) {
 	}
 }
 
+func TestPipelinePIIPixelScan(t *testing.T) {
+	const w, h, block = 256, 64, 32
+	secret := "ghp_ABCDEFGHIJKLMNOPQRSTUV"
+	pd := NewPatternDetector()
+	p := NewPipeline(PipelineConfig{Width: w, Height: h, BlockSize: block, Detector: pd})
+	defer p.Close()
+	buf := make([]byte, w*h*4)
+	for i := 0; i < len(buf); i += 4 {
+		buf[i], buf[i+1], buf[i+2], buf[i+3] = 0, 0, 0, 255 // black bg (not printable run)
+	}
+	PaintASCIIGray(buf, w*4, 8, 16, "token "+secret)
+	meta := FrameMeta{FrameID: 1, Width: w, Height: h, Stride: w * 4, BlockSize: block}
+	fr := &Frame{Meta: meta, Pixels: append([]byte(nil), buf...)}
+	pkt, err := p.Process(context.Background(), fr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pkt.Release()
+	// Plain scratch wiped.
+	for _, b := range p.plain {
+		if b != 0 {
+			t.Fatal("plaintext scratch not cleared")
+		}
+	}
+	// Redacted tiles: secret region should be black in packed payload after XOR-open —
+	// check via re-detect on a fresh buffer that still has the paint without Process wipe.
+	hits, err := pd.Detect(context.Background(), meta, buf)
+	if err != nil || len(hits) == 0 {
+		t.Fatalf("expected pixel-scan hits, got %v err=%v", hits, err)
+	}
+}
+
 func TestLuhnCard(t *testing.T) {
 	d := NewPatternDetector()
 	// Visa test PAN (passes Luhn)

@@ -115,6 +115,7 @@ static atomic_int gFrameReady = 0;
 static SCStream *gStream = nil;
 static SSStreamDelegate *gDelegate = nil;
 static NSMutableArray<NSString *> *gExcludeBundles = nil;
+static NSMutableArray<NSNumber *> *gExcludeWindows = nil;
 static int gOutW = 0, gOutH = 0, gOutStride = 0;
 
 int ss_mac_preflight(void) {
@@ -135,6 +136,18 @@ int ss_mac_set_exclude_bundle(const char *bundle_id) {
     if (!bundle_id) return 3;
     if (!gExcludeBundles) gExcludeBundles = [NSMutableArray array];
     [gExcludeBundles addObject:[NSString stringWithUTF8String:bundle_id]];
+    return 0;
+}
+
+int ss_mac_set_exclude_window(uint32_t window_id) {
+    if (!gExcludeWindows) gExcludeWindows = [NSMutableArray array];
+    [gExcludeWindows addObject:@(window_id)];
+    return 0;
+}
+
+int ss_mac_clear_excludes(void) {
+    [gExcludeBundles removeAllObjects];
+    [gExcludeWindows removeAllObjects];
     return 0;
 }
 
@@ -192,9 +205,36 @@ int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, in
         }
     }
 
-    SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:display
-                                              excludingApplications:excludeApps
-                                                   exceptingWindows:@[]];
+    NSMutableArray<SCWindow *> *excludeWins = [NSMutableArray array];
+    if (gExcludeWindows.count > 0 || excludeApps.count > 0) {
+        NSSet<NSNumber *> *wantIDs = gExcludeWindows.count > 0
+            ? [NSSet setWithArray:gExcludeWindows] : nil;
+        NSSet<SCRunningApplication *> *wantApps = excludeApps.count > 0
+            ? [NSSet setWithArray:excludeApps] : nil;
+        NSMutableSet<NSString *> *wantBundles = nil;
+        if (wantApps) {
+            wantBundles = [NSMutableSet set];
+            for (SCRunningApplication *app in wantApps) {
+                if (app.bundleIdentifier) [wantBundles addObject:app.bundleIdentifier];
+            }
+        }
+        for (SCWindow *win in content.windows) {
+            BOOL drop = NO;
+            if (wantIDs && [wantIDs containsObject:@(win.windowID)]) drop = YES;
+            if (!drop && wantBundles && win.owningApplication.bundleIdentifier &&
+                [wantBundles containsObject:win.owningApplication.bundleIdentifier]) drop = YES;
+            if (drop) [excludeWins addObject:win];
+        }
+    }
+
+    SCContentFilter *filter = nil;
+    if (excludeWins.count > 0) {
+        filter = [[SCContentFilter alloc] initWithDisplay:display excludingWindows:excludeWins];
+    } else {
+        filter = [[SCContentFilter alloc] initWithDisplay:display
+                                  excludingApplications:excludeApps
+                                       exceptingWindows:@[]];
+    }
 
     /* Prefer physical pixels (Retina), then optional scale / caps. */
     int pw = 0, ph = 0;

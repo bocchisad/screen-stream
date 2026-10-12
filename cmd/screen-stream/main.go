@@ -35,9 +35,10 @@ func main() {
 	maxH := flag.Int("max-height", 0, "cap capture height")
 	snapshot := flag.String("snapshot", "", "write reconstructed PNG (recv/loopback)")
 	preview := flag.String("preview", "", "MJPEG preview listen addr for recv/loopback (e.g. 127.0.0.1:8090)")
-	exclude := flag.String("exclude", "", "macOS bundle IDs to exclude")
-	xorSeedFlag := flag.String("xor-seed", "", "shared seed (decimal/0xHEX) for RAM XOR + wire AEAD; else env SCREEN_STREAM_XOR_SEED")
-	tokenFlag := flag.String("token", "", "auth token for hub/preview; else env SCREEN_STREAM_TOKEN")
+	exclude := flag.String("exclude", "", "macOS bundle IDs to exclude (comma-separated)")
+	excludeWin := flag.String("exclude-window", "", "macOS window IDs to exclude (comma-separated uint32)")
+	xorSeedFlag := flag.String("xor-seed", "", "bench/local RAM XOR seed (decimal/0xHEX); P2P uses ECDH-derived seed")
+	tokenFlag := flag.String("token", "", "required auth for hub/send/recv/preview; else env SCREEN_STREAM_TOKEN")
 	// legacy alias
 	webrtcAlias := flag.Bool("webrtc", false, "alias for -mode=loopback")
 	flag.Parse()
@@ -59,34 +60,42 @@ func main() {
 	}
 	token := streamer.ResolveAuthToken(*tokenFlag)
 
-	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  seed=0x%X  aead=chacha20poly1305  auth=%v\n",
-		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, seed, token != "")
+	needToken := *mode == "hub" || *mode == "send" || *mode == "recv" || *preview != ""
+	if needToken {
+		if err := streamer.RequireAuthToken(token); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  ecdh=x25519  aead=chacha20poly1305  auth=%v\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, token != "")
 
 	switch *mode {
 	case "hub":
 		runHub(*signalAddr, token)
 	case "doctor":
-		runDoctor(*signalAddr)
+		runDoctor(*signalAddr, token)
 	case "bench":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed, token: token,
-			transport: "local",
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
+			seed: seed, token: token, transport: "local",
 		})
 	case "loopback":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed, token: token,
-			snapshot: *snapshot, preview: *preview, transport: "loopback",
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
+			seed: seed, token: token, snapshot: *snapshot, preview: *preview, transport: "loopback",
 		})
 	case "send":
 		runSession(sessionOpts{
 			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, seed: seed, token: token,
-			transport: "send", signalURL: "http://" + *signalAddr,
+			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
+			seed: seed, token: token, transport: "send", signalURL: "http://" + *signalAddr,
 		})
 	case "recv":
 		runSession(sessionOpts{
@@ -119,27 +128,20 @@ func runHub(addr, token string) {
 	}
 	fmt.Printf("signaling hub listening on %s\n", url)
 	if !streamer.IsLoopbackAddr(addr) {
-		fmt.Fprintf(os.Stderr, "WARN: hub is NOT on loopback (%s) — prefer 127.0.0.1 + -token\n", addr)
+		fmt.Fprintf(os.Stderr, "WARN: hub is NOT on loopback (%s) — prefer 127.0.0.1\n", addr)
 	}
-	if token == "" {
-		fmt.Fprintf(os.Stderr, "WARN: no -token / SCREEN_STREAM_TOKEN — signaling is open\n")
-	} else {
-		fmt.Println("auth: token required on /offer /answer /ice /status")
-	}
+	fmt.Println("auth: token required on /offer /answer /ice /status")
+	fmt.Println("keys: X25519 ECDH on offer/answer (no shared -xor-seed)")
 	fmt.Println("keep this terminal open, then in TWO other terminals:")
-	tok := ""
-	if token != "" {
-		tok = " -token=…"
-	}
-	fmt.Printf("  send: go run ./cmd/screen-stream -mode=send -signal=%s -synthetic=false -scale=75 -seconds=30%s\n", clientAddr, tok)
-	fmt.Printf("  recv: go run ./cmd/screen-stream -mode=recv -signal=%s -seconds=30 -preview=127.0.0.1:8090%s\n", clientAddr, tok)
+	fmt.Printf("  send: go run ./cmd/screen-stream -mode=send -signal=%s -synthetic=false -scale=75 -seconds=30 -token=…\n", clientAddr)
+	fmt.Printf("  recv: go run ./cmd/screen-stream -mode=recv -signal=%s -seconds=30 -preview=127.0.0.1:8090 -token=…\n", clientAddr)
 	select {}
 }
 
-func runDoctor(signalAddr string) {
+func runDoctor(signalAddr, token string) {
 	fmt.Println("screen-stream doctor")
 	fmt.Printf("  go=%s  os=%s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("  xor_seed default=0x%X  env %s=%q\n", engine.DefaultXORSeed, engine.EnvXORSeedKey, os.Getenv(engine.EnvXORSeedKey))
+	fmt.Printf("  auth env %s set=%v\n", streamer.EnvAuthToken, token != "")
 
 	g := engine.NewGrabber()
 	fmt.Printf("  grabber backend=%s\n", g.Backend())
@@ -160,19 +162,26 @@ func runDoctor(signalAddr string) {
 	}
 
 	base := "http://" + signalAddr
-	res, err := httpGetStatus(base)
+	res, err := httpGetStatus(base, token)
 	if err != nil {
 		fmt.Printf("  hub %s: DOWN (%v)\n", base, err)
-		fmt.Println("  hint: go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787")
+		fmt.Println("  hint: go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787 -token=…")
 	} else {
 		fmt.Printf("  hub %s: UP %s\n", base, res)
 	}
-	fmt.Println("  preview URL (while recv runs): http://127.0.0.1:8090/")
+	fmt.Println("  preview URL (while recv runs): http://127.0.0.1:8090/?token=…")
 }
 
-func httpGetStatus(base string) (string, error) {
+func httpGetStatus(base, token string) (string, error) {
 	client := &http.Client{Timeout: 2 * time.Second}
-	res, err := client.Get(base + "/status")
+	req, err := http.NewRequest(http.MethodGet, base+"/status", nil)
+	if err != nil {
+		return "", err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -198,6 +207,7 @@ type sessionOpts struct {
 	compress                bool
 	scale, maxW, maxH       int
 	exclude                 string
+	excludeWin              string
 	seed                    uint64
 	snapshot                string
 	preview                 string // MJPEG listen addr
@@ -227,7 +237,7 @@ func runSession(o sessionOpts) {
 		sink = local
 
 	case "loopback":
-		rec = streamer.NewFrameReconstructor(o.seed)
+		rec = streamer.NewFrameReconstructor(1)
 		prev := startPreview(o.preview, o.token)
 		if prev != nil {
 			defer prev.Close()
@@ -238,7 +248,10 @@ func runSession(o sessionOpts) {
 		rtc, rtcPeer, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
-			Seed:      o.seed,
+			OnSessionReady: func(seed uint64) {
+				o.seed = seed
+				rec.SetSeed(seed)
+			},
 			OnPacket: func(b []byte) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
@@ -252,31 +265,33 @@ func runSession(o sessionOpts) {
 			fmt.Fprintf(os.Stderr, "webrtc loopback: %v\n", err)
 			os.Exit(1)
 		}
+		o.seed = rtc.SessionSeed()
 		defer rtc.Stop()
 		defer rtcPeer.Stop()
 		sink = rtc
-		fmt.Printf("webrtc: loopback (compress=%v)\n", o.compress)
+		fmt.Printf("webrtc: loopback (compress=%v ecdh_seed=0x%X)\n", o.compress, o.seed)
 
 	case "send":
 		sig := streamer.NewHTTPSignalingClientToken(o.signalURL, o.token)
-		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{RingDepth: 4, Compress: o.compress, Seed: o.seed})
+		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{RingDepth: 4, Compress: o.compress})
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		if err := rtc.DialOfferer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial offer: %v\n", err)
 			fmt.Fprintf(os.Stderr, "hint: hub must be running, and recv should be started around the same time:\n")
-			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787\n")
-			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -preview=127.0.0.1:8090 -xor-seed=...\n")
+			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787 -token=…\n")
+			fmt.Fprintf(os.Stderr, "  go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -preview=127.0.0.1:8090 -token=…\n")
 			os.Exit(1)
 		}
 		dialCancel()
+		o.seed = rtc.SessionSeed()
 		_ = rtc.StartSendLoop(context.Background())
 		defer rtc.Stop()
 		sink = rtc
-		fmt.Printf("webrtc: send → %s\n", o.signalURL)
+		fmt.Printf("webrtc: send → %s  ecdh_seed=0x%X\n", o.signalURL, o.seed)
 
 	case "recv":
-		rec = streamer.NewFrameReconstructor(o.seed)
+		rec = streamer.NewFrameReconstructor(1)
 		prev := startPreview(o.preview, o.token)
 		if prev != nil {
 			defer prev.Close()
@@ -286,7 +301,10 @@ func runSession(o sessionOpts) {
 		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
-			Seed:      o.seed,
+			OnSessionReady: func(seed uint64) {
+				o.seed = seed
+				rec.SetSeed(seed)
+			},
 			OnPacket: func(b []byte) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
@@ -299,16 +317,17 @@ func runSession(o sessionOpts) {
 		if err := rtc.DialAnswerer(dialCtx, sig); err != nil {
 			dialCancel()
 			fmt.Fprintf(os.Stderr, "dial answer: %v\n", err)
-			fmt.Fprintf(os.Stderr, "hint: need THREE terminals, same xor-seed:\n")
-			fmt.Fprintf(os.Stderr, "  1) go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787\n")
-			fmt.Fprintf(os.Stderr, "  2) go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 -synthetic=false -seconds=30 -xor-seed=0xC0FFEE42D00D\n")
-			fmt.Fprintf(os.Stderr, "  3) go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -seconds=30 -preview=127.0.0.1:8090 -xor-seed=0xC0FFEE42D00D\n")
+			fmt.Fprintf(os.Stderr, "hint: need THREE terminals, same -token:\n")
+			fmt.Fprintf(os.Stderr, "  1) go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787 -token=…\n")
+			fmt.Fprintf(os.Stderr, "  2) go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 -synthetic=false -seconds=30 -token=…\n")
+			fmt.Fprintf(os.Stderr, "  3) go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 -seconds=30 -preview=127.0.0.1:8090 -token=…\n")
 			fmt.Fprintf(os.Stderr, "start send+recv while hub is up; if stuck, restart hub.\n")
 			os.Exit(1)
 		}
 		dialCancel()
+		o.seed = rtc.SessionSeed()
 		defer rtc.Stop()
-		fmt.Printf("webrtc: recv ← %s\n", o.signalURL)
+		fmt.Printf("webrtc: recv ← %s  ecdh_seed=0x%X\n", o.signalURL, o.seed)
 		<-ctx.Done()
 		time.Sleep(200 * time.Millisecond)
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
@@ -341,6 +360,9 @@ func runSession(o sessionOpts) {
 	}
 	if o.exclude != "" {
 		cfg.ExcludeBundleIDs = splitCSV(o.exclude)
+	}
+	if o.excludeWin != "" {
+		cfg.ExcludeWindowIDs = parseUint32CSV(o.excludeWin)
 	}
 	if err := grabber.Open(ctx, cfg); err != nil {
 		var pe *engine.PermissionError
@@ -390,10 +412,7 @@ func runSession(o sessionOpts) {
 	if o.ocr {
 		detector = engine.NewOCRDetector(engine.NewVisionOCRBackend())
 	} else if o.pii {
-		pd := engine.NewPatternDetector()
-		// Explicit demo mask only when -pii is on (top-left block).
-		pd.SetHits([]engine.Rect{{X: 0, Y: 0, W: uint16(block), H: uint16(block)}})
-		detector = pd
+		detector = engine.NewPatternDetector() // ASCII-luminance + LayoutHits; use -ocr for glyphs
 	}
 
 	pipe := engine.NewPipeline(engine.PipelineConfig{
@@ -513,9 +532,6 @@ func startPreview(addr, token string) *streamer.PreviewServer {
 	if !streamer.IsLoopbackAddr(addr) {
 		fmt.Fprintf(os.Stderr, "WARN: preview is NOT on loopback (%s)\n", addr)
 	}
-	if token == "" {
-		fmt.Fprintf(os.Stderr, "WARN: preview has no -token — anyone on the bind addr can watch\n")
-	}
 	p := streamer.NewPreviewServer(70)
 	p.Token = token
 	url, err := p.ListenAndServe(addr)
@@ -558,6 +574,19 @@ func splitCSV(s string) []string {
 			}
 			start = i + 1
 		}
+	}
+	return out
+}
+
+func parseUint32CSV(s string) []uint32 {
+	parts := splitCSV(s)
+	out := make([]uint32, 0, len(parts))
+	for _, p := range parts {
+		var n uint64
+		if _, err := fmt.Sscanf(strings.TrimSpace(p), "%d", &n); err != nil {
+			continue
+		}
+		out = append(out, uint32(n))
 	}
 	return out
 }

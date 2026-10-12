@@ -1,0 +1,62 @@
+package streamer
+
+import (
+	"crypto/ecdh"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"io"
+
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
+)
+
+// SessionDesc is SDP plus an ephemeral X25519 public key for ECDH.
+type SessionDesc struct {
+	SDP    string
+	PubKey []byte // 32 bytes
+}
+
+// GenerateKXKeypair returns X25519 private+public (32 bytes each).
+func GenerateKXKeypair() (priv, pub []byte, err error) {
+	k, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	return k.Bytes(), k.PublicKey().Bytes(), nil
+}
+
+// DeriveSessionSecrets ECDH(priv, peerPub) → AEAD key (32) + XOR seed (u64) via HKDF.
+func DeriveSessionSecrets(priv, peerPub []byte) (aeadKey []byte, xorSeed uint64, err error) {
+	if len(priv) != 32 || len(peerPub) != 32 {
+		return nil, 0, fmt.Errorf("kx: want 32-byte keys")
+	}
+	curve := ecdh.X25519()
+	privK, err := curve.NewPrivateKey(priv)
+	if err != nil {
+		return nil, 0, err
+	}
+	pubK, err := curve.NewPublicKey(peerPub)
+	if err != nil {
+		return nil, 0, err
+	}
+	shared, err := privK.ECDH(pubK)
+	if err != nil {
+		return nil, 0, err
+	}
+	r := hkdf.New(sha256.New, shared, []byte("screen-stream-v1"), []byte("session-v1"))
+	aeadKey = make([]byte, chacha20poly1305.KeySize)
+	if _, err := io.ReadFull(r, aeadKey); err != nil {
+		return nil, 0, err
+	}
+	var seedBuf [8]byte
+	if _, err := io.ReadFull(r, seedBuf[:]); err != nil {
+		return nil, 0, err
+	}
+	xorSeed = binary.LittleEndian.Uint64(seedBuf[:])
+	if xorSeed == 0 {
+		xorSeed = 1 // never use 0 (ResolveXORSeed sentinel)
+	}
+	return aeadKey, xorSeed, nil
+}

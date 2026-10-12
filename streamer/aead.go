@@ -29,9 +29,17 @@ func DeriveWireKey(seed uint64) []byte {
 	return key
 }
 
-// NewWireAEAD builds an AEAD from a shared seed.
+// NewWireAEAD builds an AEAD from a shared seed (legacy / tests).
 func NewWireAEAD(seed uint64) (cipher.AEAD, error) {
 	return chacha20poly1305.New(DeriveWireKey(seed))
+}
+
+// NewWireAEADFromKey builds AEAD from a raw 32-byte key (ECDH-derived).
+func NewWireAEADFromKey(key []byte) (cipher.AEAD, error) {
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, fmt.Errorf("aead key: want %d bytes", chacha20poly1305.KeySize)
+	}
+	return chacha20poly1305.New(key)
 }
 
 // SealWire wraps a packed DirtyPacket: magic | nonce | ciphertext+tag.

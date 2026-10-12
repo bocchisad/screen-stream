@@ -35,8 +35,10 @@ type OCRDetector struct {
 }
 
 func NewOCRDetector(backend OCRBackend) *OCRDetector {
+	pd := NewPatternDetector()
+	pd.PixelScan = false // OCR supplies layout hits
 	return &OCRDetector{
-		Patterns: NewPatternDetector(),
+		Patterns: pd,
 		Backend:  backend,
 		Every:    15,
 		hits:     make([]Rect, 0, 32),

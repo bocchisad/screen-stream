@@ -41,17 +41,22 @@ type WebRTCSession struct {
 	reasm     *ChunkReassembler
 	aead      cipher.AEAD
 	aeadBuf   []byte
-	seed      uint64
+	seed           uint64 // session XOR seed (ECDH-derived after dial)
+	kxPriv         []byte
+	disableAEAD    bool
+	onSessionReady func(uint64)
 }
 
 type SessionConfig struct {
-	RingDepth int
-	Label     string
-	OnPacket  func([]byte) // inbound DirtyPacket wire after reassembly (+ AEAD open)
-	Compress  bool         // zlib payload before send
-	ChunkSize int          // 0 → DefaultChunkSize
-	Seed      uint64       // shared seed → wire AEAD key (0 → DefaultXORSeed)
-	DisableAEAD bool       // test-only: send plaintext DirtyPackets
+	RingDepth      int
+	Label          string
+	OnPacket       func([]byte) // inbound DirtyPacket after reassembly + AEAD open
+	OnSessionReady func(uint64) // ECDH XOR seed — before DataChannel open
+	Compress       bool
+	ChunkSize      int
+	DisableAEAD    bool // test-only
+	// Seed is unused for wire keys when ECDH succeeds; kept for DisableAEAD tests.
+	Seed uint64
 }
 
 func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
@@ -64,32 +69,28 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 	if cfg.ChunkSize <= 0 {
 		cfg.ChunkSize = DefaultChunkSize
 	}
-	if cfg.Seed == 0 {
-		cfg.Seed = engine.DefaultXORSeed
-	}
 	s := &WebRTCSession{
-		ring:      engine.NewDeliveryRing(cfg.RingDepth),
-		label:     cfg.Label,
-		onPacket:  cfg.OnPacket,
-		compress:  cfg.Compress,
-		chunkSize: cfg.ChunkSize,
-		seed:      cfg.Seed,
-		packBuf:   make([]byte, 0, 8<<20),
-		chunkBuf:  make([]byte, ChunkHeaderSize+DefaultChunkSize),
-		sendCopy:  make([]byte, ChunkHeaderSize+DefaultChunkSize),
-		aeadBuf:   make([]byte, 0, 8<<20),
-		dcOpen:    make(chan struct{}),
-	}
-	if !cfg.DisableAEAD {
-		aead, err := NewWireAEAD(cfg.Seed)
-		if err == nil {
-			s.aead = aead
-		}
+		ring:           engine.NewDeliveryRing(cfg.RingDepth),
+		label:          cfg.Label,
+		onPacket:       cfg.OnPacket,
+		onSessionReady: cfg.OnSessionReady,
+		compress:       cfg.Compress,
+		chunkSize:      cfg.ChunkSize,
+		seed:           cfg.Seed,
+		disableAEAD:    cfg.DisableAEAD,
+		packBuf:        make([]byte, 0, 8<<20),
+		chunkBuf:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
+		sendCopy:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
+		aeadBuf:        make([]byte, 0, 8<<20),
+		dcOpen:         make(chan struct{}),
 	}
 	s.reasm = NewChunkReassemblerSize(func(full []byte) {
 		s.recv.Add(1)
 		s.bytesRecv.Add(uint64(len(full)))
-		plain, err := OpenWire(s.aead, full)
+		s.mu.Lock()
+		aead := s.aead
+		s.mu.Unlock()
+		plain, err := OpenWire(aead, full)
 		if err != nil {
 			return
 		}
@@ -98,6 +99,38 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 		}
 	}, s.chunkSize)
 	return s
+}
+
+// SessionSeed is the ECDH-derived XOR seed (valid after successful Dial*).
+func (s *WebRTCSession) SessionSeed() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seed
+}
+
+func (s *WebRTCSession) applySessionKeys(aeadKey []byte, xorSeed uint64) error {
+	s.mu.Lock()
+	s.seed = xorSeed
+	cb := s.onSessionReady
+	if s.disableAEAD {
+		s.aead = nil
+		s.mu.Unlock()
+		if cb != nil {
+			cb(xorSeed)
+		}
+		return nil
+	}
+	aead, err := NewWireAEADFromKey(aeadKey)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.aead = aead
+	s.mu.Unlock()
+	if cb != nil {
+		cb(xorSeed)
+	}
+	return nil
 }
 
 func (s *WebRTCSession) TryEnqueue(pkt *engine.DirtyPacket) { s.ring.TryEnqueue(pkt) }
@@ -120,6 +153,12 @@ func newPeerConnection() (*webrtc.PeerConnection, error) {
 
 func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	s.offerer = true
+	priv, pub, err := GenerateKXKeypair()
+	if err != nil {
+		return err
+	}
+	s.kxPriv = priv
+
 	pc, err := newPeerConnection()
 	if err != nil {
 		return err
@@ -127,7 +166,6 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	s.pc = pc
 
 	ordered := true
-	// Ordered + reliable (no MaxRetransmits) — required for chunk reassembly.
 	dc, err := pc.CreateDataChannel(s.label, &webrtc.DataChannelInit{Ordered: &ordered})
 	if err != nil {
 		_ = pc.Close()
@@ -144,15 +182,22 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 		return err
 	}
 	<-webrtc.GatheringCompletePromise(pc)
-	if err := sig.SendOffer(pc.LocalDescription().SDP); err != nil {
+	if err := sig.SendOffer(SessionDesc{SDP: pc.LocalDescription().SDP, PubKey: pub}); err != nil {
 		return err
 	}
 
-	answerSDP, err := sig.RecvAnswer(ctx)
+	ans, err := sig.RecvAnswer(ctx)
 	if err != nil {
 		return err
 	}
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); err != nil {
+	aeadKey, xorSeed, err := DeriveSessionSecrets(priv, ans.PubKey)
+	if err != nil {
+		return fmt.Errorf("ecdh: %w", err)
+	}
+	if err := s.applySessionKeys(aeadKey, xorSeed); err != nil {
+		return err
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP}); err != nil {
 		return err
 	}
 	return s.waitDC(ctx)
@@ -160,6 +205,12 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 
 func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	s.offerer = false
+	priv, pub, err := GenerateKXKeypair()
+	if err != nil {
+		return err
+	}
+	s.kxPriv = priv
+
 	pc, err := newPeerConnection()
 	if err != nil {
 		return err
@@ -170,11 +221,18 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	})
 	s.wireICE(ctx, sig, false)
 
-	offerSDP, err := sig.RecvOffer(ctx)
+	off, err := sig.RecvOffer(ctx)
 	if err != nil {
 		return err
 	}
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offerSDP}); err != nil {
+	aeadKey, xorSeed, err := DeriveSessionSecrets(priv, off.PubKey)
+	if err != nil {
+		return fmt.Errorf("ecdh: %w", err)
+	}
+	if err := s.applySessionKeys(aeadKey, xorSeed); err != nil {
+		return err
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: off.SDP}); err != nil {
 		return err
 	}
 	answer, err := pc.CreateAnswer(nil)
@@ -185,7 +243,7 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 		return err
 	}
 	<-webrtc.GatheringCompletePromise(pc)
-	if err := sig.SendAnswer(pc.LocalDescription().SDP); err != nil {
+	if err := sig.SendAnswer(SessionDesc{SDP: pc.LocalDescription().SDP, PubKey: pub}); err != nil {
 		return err
 	}
 	return s.waitDC(ctx)
@@ -310,9 +368,12 @@ func (s *WebRTCSession) sendPacket(pkt *engine.DirtyPacket) {
 	if _, err := PackInto(pkt, buf); err != nil {
 		return
 	}
+	s.mu.Lock()
+	aead := s.aead
+	s.mu.Unlock()
 	wire := buf
-	if s.aead != nil {
-		sealed, err := SealWire(s.aead, buf, s.aeadBuf)
+	if aead != nil {
+		sealed, err := SealWire(aead, buf, s.aeadBuf)
 		if err != nil {
 			return
 		}
@@ -363,6 +424,7 @@ func ConnectLoopbackOpts(ctx context.Context, cfg SessionConfig) (sender, receiv
 	sig := NewLoopbackSignaling()
 	sendCfg := cfg
 	sendCfg.OnPacket = nil
+	sendCfg.OnSessionReady = nil // seed callback only on receiver side
 	recvCfg := cfg
 	sender = NewWebRTCSession(sendCfg)
 	receiver = NewWebRTCSession(recvCfg)

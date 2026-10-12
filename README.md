@@ -22,34 +22,29 @@ go test ./engine/ ./streamer/ -count=1
 go run ./cmd/screen-stream -mode=bench -synthetic=false -scale=100 -seconds=3
 
 # Loopback P2P + snapshot + live preview
+export SCREEN_STREAM_TOKEN=dev-secret
 go run ./cmd/screen-stream -mode=loopback -synthetic=false -scale=100 \
   -seconds=10 -snapshot=/tmp/ss.png -preview=127.0.0.1:8090
-# open http://127.0.0.1:8090/
 
-# Three terminals — same -xor-seed and -token on all peers
+# Three terminals — same -token; session keys via X25519 ECDH
 export SCREEN_STREAM_TOKEN=dev-secret
-# terminal 1:
 go run ./cmd/screen-stream -mode=hub -signal=127.0.0.1:8787
-# terminal 2 (recv first):
 go run ./cmd/screen-stream -mode=recv -signal=127.0.0.1:8787 \
-  -seconds=30 -snapshot=/tmp/recv.png -preview=127.0.0.1:8090 \
-  -xor-seed=0xDEADBEEFCAFEBABE
-# terminal 3:
+  -seconds=30 -snapshot=/tmp/recv.png -preview=127.0.0.1:8090
 go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
-  -synthetic=false -scale=75 -seconds=30 -xor-seed=0xDEADBEEFCAFEBABE
-# open the preview URL printed by recv (includes ?token= when set)
+  -synthetic=false -scale=75 -seconds=30
 ```
 
-Shared seed: `-xor-seed` / `SCREEN_STREAM_XOR_SEED` → RAM XOR **and** wire **ChaCha20-Poly1305** (HKDF).
-Default seed is public — set a private seed for real use. RAM XOR alone is still only obfuscation.
+**Auth (required):** `-token` / `SCREEN_STREAM_TOKEN` for `hub` / `send` / `recv` / `-preview`.
 
-Auth: `-token` / `SCREEN_STREAM_TOKEN` on hub + preview (`Authorization: Bearer` or `?token=`).
-Bind hub/preview to `127.0.0.1`. Without `-token`, signaling/preview stay open (dev).
+**Keys:** X25519 on offer/answer → HKDF → ChaCha20-Poly1305 + RAM XOR seed (`ecdh_seed`).
+`-xor-seed` only for local `bench`.
 
 Useful flags:
-- `-pii` — demo corner blackout (off by default)
-- `-ocr` — on-device Vision OCR → pattern redaction (macOS)
-- `-preview=host:port` — MJPEG viewer on recv/loopback
+- `-pii` — PatternDetector (ASCII-luminance + layout hits)
+- `-ocr` — Vision OCR → pattern redaction (macOS)
+- `-exclude` / `-exclude-window` — macOS share-set filters
+- `-preview=host:port` — MJPEG on recv/loopback
 
 Exit `2` = screen permission denied.
 
@@ -57,29 +52,26 @@ Exit `2` = screen permission denied.
 
 | Spec item | Status |
 |-----------|--------|
-| Zero-alloc capture pool | Done (~0–1 alloc/frame after warmup; pure-Go XOR/hash/diff) |
-| macOS ScreenCaptureKit BGRA + filter | Done (Retina native) |
-| Linux X11 XShm | Done |
-| Wayland PipeWire | Portal CreateSession plumbing when `-DSS_HAVE_PIPEWIRE=1`; capture still needs grant+stream map |
-| OutputSize API | Done — no 8K probe alloc; macOS/X11/synthetic |
-| Frame diff + dirty boxes | Done (word FNV + H/V run merge) |
-| RAM XOR protect | Done (pure-Go hot path; C retained in tree) |
-| PII masking | PatternDetector + Luhn PANs + OCR/Vision (`-ocr`) |
-| WebRTC DataChannel | Done (chunked SSCH + pooled zlib + ChaCha20-Poly1305) |
-| P2P without cloud SFU | Done (local hub; token auth; `/` help + `/status`) |
-| Hub/preview auth | Done (`-token` / `SCREEN_STREAM_TOKEN`) |
-| Viewer UI | MJPEG `-preview` + PNG `-snapshot` |
-| Wire stats | `wire_bytes_*` + Mbit/s on send/recv/loopback |
-| FHD p99 &lt; 10ms | Done on synthetic FHD; high-res auto `-block=128` |
-| Doctor | `-mode=doctor` checks grabber + hub |
+| Zero-alloc capture pool | **Process** hot path 0 alloc (CI test); full capture loop may still malloc (native frame) |
+| macOS ScreenCaptureKit BGRA + filter | Done (bundle + window exclude) |
+| Linux X11 XShm | Done (packed BGRA normalize) |
+| Wayland PipeWire | Done when built `-DSS_HAVE_PIPEWIRE=1` (portal Session→Start + pw_stream BGRA/RGBA); default build returns unavailable |
+| OutputSize API | Done |
+| Frame diff + dirty boxes | Done |
+| RAM XOR protect | Done; plaintext scratch cleared after Process |
+| PII masking | PatternDetector pixel ASCII + LayoutHits; glyphs need `-ocr` |
+| WebRTC DataChannel | Done (SSCH + zlib + AEAD) |
+| P2P without cloud SFU | Done (hub + mandatory token + ECDH) |
+| Session key exchange | Done (X25519 + HKDF) |
+| Viewer UI | MJPEG + PNG |
+| FHD p99 &lt; 10ms | CI soft gate on synthetic Process; live high-res may auto `-block=128` |
+| Doctor | `-mode=doctor` |
 | GPU / video encode | Not in v0 |
-
-**Preview URL:** `http://127.0.0.1:8090/` (recv). Hub `:8787` is signaling only.
 
 ## Layout
 
 ```
-engine/     grabber_*, pipeline, protect_{cgo,pure}, pii, ocr_vision_*, pool, native/
-streamer/   webrtc, chunk, compress, proto, receiver, preview, http_signaling
+engine/     grabber_*, pipeline, protect_*, pii*, ocr_vision_*, pool, native/
+streamer/   webrtc, kx, aead, auth, chunk, compress, proto, receiver, preview, http_signaling
 cmd/screen-stream/
 ```

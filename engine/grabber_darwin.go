@@ -40,10 +40,14 @@ func (g *macGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 		cfg.ScalePercent = 100
 		g.cfg.ScalePercent = 100
 	}
+	C.ss_mac_clear_excludes()
 	for _, bid := range cfg.ExcludeBundleIDs {
 		cBid := C.CString(bid)
 		C.ss_mac_set_exclude_bundle(cBid)
 		C.free(unsafe.Pointer(cBid))
+	}
+	for _, wid := range cfg.ExcludeWindowIDs {
+		C.ss_mac_set_exclude_window(C.uint32_t(wid))
 	}
 	rc := int(C.ss_mac_start_ex(
 		C.int(cfg.DisplayIndex),

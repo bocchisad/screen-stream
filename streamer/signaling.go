@@ -7,54 +7,54 @@ import (
 
 // ICECandidateJSON is a trickle ICE candidate on the wire.
 type ICECandidateJSON struct {
-	Candidate     string `json:"candidate"`
-	SDPMid        string `json:"sdpMid"`
+	Candidate     string  `json:"candidate"`
+	SDPMid        string  `json:"sdpMid"`
 	SDPMLineIndex *uint16 `json:"sdpMLineIndex"`
 }
 
-// Signaling exchanges SDP/ICE. Loopback used for local e2e.
+// Signaling exchanges SDP+ECDH pubkeys and ICE.
 type Signaling interface {
-	SendOffer(sdp string) error
-	RecvOffer(ctx context.Context) (string, error)
-	SendAnswer(sdp string) error
-	RecvAnswer(ctx context.Context) (string, error)
+	SendOffer(d SessionDesc) error
+	RecvOffer(ctx context.Context) (SessionDesc, error)
+	SendAnswer(d SessionDesc) error
+	RecvAnswer(ctx context.Context) (SessionDesc, error)
 	SendICE(fromOfferer bool, c ICECandidateJSON) error
 	RecvICE(ctx context.Context, fromOfferer bool) (ICECandidateJSON, error)
 }
 
 // LoopbackSignaling connects two local peers in-process.
 type LoopbackSignaling struct {
-	offer     chan string
-	answer    chan string
-	iceOffer  chan ICECandidateJSON // offerer → answerer
-	iceAnswer chan ICECandidateJSON // answerer → offerer
+	offer     chan SessionDesc
+	answer    chan SessionDesc
+	iceOffer  chan ICECandidateJSON
+	iceAnswer chan ICECandidateJSON
 }
 
 func NewLoopbackSignaling() *LoopbackSignaling {
 	return &LoopbackSignaling{
-		offer:     make(chan string, 1),
-		answer:    make(chan string, 1),
+		offer:     make(chan SessionDesc, 1),
+		answer:    make(chan SessionDesc, 1),
 		iceOffer:  make(chan ICECandidateJSON, 32),
 		iceAnswer: make(chan ICECandidateJSON, 32),
 	}
 }
 
-func (s *LoopbackSignaling) SendOffer(sdp string) error  { s.offer <- sdp; return nil }
-func (s *LoopbackSignaling) SendAnswer(sdp string) error { s.answer <- sdp; return nil }
+func (s *LoopbackSignaling) SendOffer(d SessionDesc) error  { s.offer <- d; return nil }
+func (s *LoopbackSignaling) SendAnswer(d SessionDesc) error { s.answer <- d; return nil }
 
-func (s *LoopbackSignaling) RecvOffer(ctx context.Context) (string, error) {
+func (s *LoopbackSignaling) RecvOffer(ctx context.Context) (SessionDesc, error) {
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return SessionDesc{}, ctx.Err()
 	case v := <-s.offer:
 		return v, nil
 	}
 }
 
-func (s *LoopbackSignaling) RecvAnswer(ctx context.Context) (string, error) {
+func (s *LoopbackSignaling) RecvAnswer(ctx context.Context) (SessionDesc, error) {
 	select {
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return SessionDesc{}, ctx.Err()
 	case v := <-s.answer:
 		return v, nil
 	}
@@ -90,7 +90,6 @@ func (s *LoopbackSignaling) RecvICE(ctx context.Context, fromOfferer bool) (ICEC
 	}
 }
 
-// EncodeICE / DecodeICE helpers for text transports.
 func EncodeICE(c ICECandidateJSON) ([]byte, error) { return json.Marshal(c) }
 func DecodeICE(b []byte) (ICECandidateJSON, error) {
 	var c ICECandidateJSON

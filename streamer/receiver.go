@@ -31,6 +31,15 @@ func NewFrameReconstructor(seed uint64) *FrameReconstructor {
 	return &FrameReconstructor{seed: seed}
 }
 
+// SetSeed updates the XOR seed (call after ECDH dial before applying frames).
+func (r *FrameReconstructor) SetSeed(seed uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if seed != 0 {
+		r.seed = seed
+	}
+}
+
 func (r *FrameReconstructor) Stats() (frames, tiles uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

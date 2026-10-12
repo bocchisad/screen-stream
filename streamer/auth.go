@@ -2,6 +2,7 @@ package streamer
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -9,12 +10,20 @@ import (
 
 const EnvAuthToken = "SCREEN_STREAM_TOKEN"
 
-// ResolveAuthToken returns CLI token, else env, else empty (auth disabled).
+// ResolveAuthToken returns CLI token, else env, else empty.
 func ResolveAuthToken(cli string) string {
 	if t := strings.TrimSpace(cli); t != "" {
 		return t
 	}
 	return strings.TrimSpace(os.Getenv(EnvAuthToken))
+}
+
+// RequireAuthToken fails if token is empty (hub/send/recv/preview).
+func RequireAuthToken(token string) error {
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("auth token required: set -token or %s", EnvAuthToken)
+	}
+	return nil
 }
 
 // CheckRequestToken validates Bearer or ?token= against expected.

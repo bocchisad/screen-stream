@@ -55,4 +55,10 @@ func TestAuthToken(t *testing.T) {
 	if !CheckRequestToken(req2, "") {
 		t.Fatal("empty expected allows")
 	}
+	if err := RequireAuthToken(""); err == nil {
+		t.Fatal("RequireAuthToken empty")
+	}
+	if err := RequireAuthToken("x"); err != nil {
+		t.Fatal(err)
+	}
 }

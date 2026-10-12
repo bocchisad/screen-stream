@@ -92,17 +92,42 @@ func (g *linuxGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, erro
 	}
 
 	var info C.ss_frame_info
-	var rc int
-	switch g.backend {
-	case "pipewire":
-		rc = int(C.ss_pw_capture((*C.uint8_t)(unsafe.Pointer(&dst[0])), C.int(len(dst)), &info))
-	default:
-		rc = int(C.ss_x11_capture((*C.uint8_t)(unsafe.Pointer(&dst[0])), C.int(len(dst)), &info))
+	wait := 100 * time.Millisecond
+	if g.cfg.FPS > 0 {
+		wait = time.Second / time.Duration(g.cfg.FPS) * 2
+		if wait < 50*time.Millisecond {
+			wait = 50 * time.Millisecond
+		}
+		if wait > 250*time.Millisecond {
+			wait = 250 * time.Millisecond
+		}
 	}
-	if rc == 1 {
-		return FrameMeta{}, &PermissionError{Platform: "linux", Hint: LinuxPortalHint(), Err: ErrPermissionDenied}
-	}
-	if rc != 0 {
+	deadline := time.Now().Add(wait)
+	for {
+		var rc int
+		switch g.backend {
+		case "pipewire":
+			rc = int(C.ss_pw_capture((*C.uint8_t)(unsafe.Pointer(&dst[0])), C.int(len(dst)), &info))
+		default:
+			rc = int(C.ss_x11_capture((*C.uint8_t)(unsafe.Pointer(&dst[0])), C.int(len(dst)), &info))
+		}
+		if rc == 0 {
+			break
+		}
+		if rc == 1 {
+			return FrameMeta{}, &PermissionError{Platform: "linux", Hint: LinuxPortalHint(), Err: ErrPermissionDenied}
+		}
+		if rc == 4 {
+			if time.Now().After(deadline) {
+				return FrameMeta{}, fmt.Errorf("%w: no frame", ErrBackendUnavailable)
+			}
+			select {
+			case <-ctx.Done():
+				return FrameMeta{}, ctx.Err()
+			case <-time.After(500 * time.Microsecond):
+			}
+			continue
+		}
 		return FrameMeta{}, fmt.Errorf("%w: capture code=%d", ErrBackendUnavailable, rc)
 	}
 
@@ -119,11 +144,17 @@ func (g *linuxGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, erro
 }
 
 func (g *linuxGrabber) OutputSize() (width, height, stride int, ok bool) {
-	if !g.started || g.backend == "pipewire" {
+	if !g.started {
 		return 0, 0, 0, false
 	}
 	var w, h, s C.int
-	if int(C.ss_x11_output_size(&w, &h, &s)) != 0 {
+	var rc int
+	if g.backend == "pipewire" {
+		rc = int(C.ss_pw_output_size(&w, &h, &s))
+	} else {
+		rc = int(C.ss_x11_output_size(&w, &h, &s))
+	}
+	if rc != 0 {
 		return 0, 0, 0, false
 	}
 	return int(w), int(h), int(s), true

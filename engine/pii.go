@@ -8,13 +8,16 @@ import (
 )
 
 // PatternDetector is the default on-device redaction helper.
-// Full OCR plugs in via PIIDetector; this impl uses injected "layout hits"
-// plus optional synthetic scan of a plaintext overlay provided by tests.
+// LayoutHits come from OCR; PixelScan finds ASCII-luminance overlays in BGRA.
 type PatternDetector struct {
-	mu       sync.Mutex
-	patterns []*regexp.Regexp
-	// LayoutHits supplies precomputed rects (e.g. from OCR goroutine).
+	mu         sync.Mutex
+	patterns   []*regexp.Regexp
 	LayoutHits []Rect
+	// PixelScan enables grayscale ASCII-run regex scan of BGRA (default true).
+	PixelScan bool
+
+	outScratch  []Rect
+	textScratch []byte
 }
 
 func NewPatternDetector() *PatternDetector {
@@ -28,19 +31,31 @@ func NewPatternDetector() *PatternDetector {
 	for _, p := range pats {
 		compiled = append(compiled, regexp.MustCompile(p))
 	}
-	return &PatternDetector{patterns: compiled}
+	return &PatternDetector{
+		patterns:    compiled,
+		PixelScan:   true,
+		outScratch:  make([]Rect, 0, 32),
+		textScratch: make([]byte, 0, 256),
+	}
 }
 
-// Detect returns rects to black out. Prefer DetectInto on the hot path.
+// Detect returns rects to black out (layout hits + optional pixel ASCII scan).
 func (d *PatternDetector) Detect(ctx context.Context, meta FrameMeta, plaintextBGRA []byte) ([]Rect, error) {
 	_ = ctx
-	_ = plaintextBGRA
-	_ = meta
-	out := d.DetectInto(nil)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := d.outScratch[:0]
+	if len(d.LayoutHits) > 0 {
+		out = append(out, d.LayoutHits...)
+	}
+	if d.PixelScan && len(plaintextBGRA) > 0 {
+		out, d.textScratch = scanBGRASecrets(plaintextBGRA, meta, d.patterns, out, d.textScratch)
+	}
+	d.outScratch = out
 	return out, nil
 }
 
-// DetectInto appends layout hits into dst (reused buffer) — zero alloc when cap suffices.
+// DetectInto appends layout hits into dst (legacy / OCR hot path).
 func (d *PatternDetector) DetectInto(dst []Rect) []Rect {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -53,7 +68,7 @@ func (d *PatternDetector) DetectInto(dst []Rect) []Rect {
 	return append(dst[:0], d.LayoutHits...)
 }
 
-// SetHits replaces layout redaction rects (called from OCR worker; not on hot path alloc-sensitive).
+// SetHits replaces layout redaction rects (called from OCR worker).
 func (d *PatternDetector) SetHits(rects []Rect) {
 	d.mu.Lock()
 	d.LayoutHits = append(d.LayoutHits[:0], rects...)
@@ -61,7 +76,6 @@ func (d *PatternDetector) SetHits(rects []Rect) {
 }
 
 // ScanText maps matching pattern spans to block-aligned rects (helper for OCR/text layer).
-// Card-like digit runs must also pass Luhn.
 func (d *PatternDetector) ScanText(text string, lineRect Rect, blockSize uint16) []Rect {
 	if blockSize == 0 {
 		blockSize = 64
@@ -73,7 +87,7 @@ func (d *PatternDetector) ScanText(text string, lineRect Rect, blockSize uint16)
 				continue
 			}
 			hits = append(hits, alignRect(lineRect, blockSize))
-			break // one hit per pattern family is enough for the line rect
+			break
 		}
 	}
 	return hits
@@ -89,7 +103,6 @@ func digitsOnly(s string) string {
 	return string(b)
 }
 
-// luhnValid implements the Luhn checksum for PAN-like digit strings.
 func luhnValid(digits string) bool {
 	n := len(digits)
 	if n < 13 || n > 19 {

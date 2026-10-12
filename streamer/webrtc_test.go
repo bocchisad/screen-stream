@@ -14,10 +14,10 @@ func TestWebRTCLoopback(t *testing.T) {
 	defer cancel()
 
 	var got atomic.Uint64
-	rec := NewFrameReconstructor(engine.DefaultXORSeed)
+	rec := NewFrameReconstructor(1)
 	sender, receiver, err := ConnectLoopbackOpts(ctx, SessionConfig{
 		Compress: true,
-		Seed:     engine.DefaultXORSeed,
+		OnSessionReady: func(seed uint64) { rec.SetSeed(seed) },
 		OnPacket: func(b []byte) {
 			_ = rec.Apply(b)
 			got.Add(1)
@@ -29,9 +29,14 @@ func TestWebRTCLoopback(t *testing.T) {
 	defer sender.Stop()
 	defer receiver.Stop()
 
+	seed := sender.SessionSeed()
+	if seed == 0 || seed != receiver.SessionSeed() {
+		t.Fatalf("session seeds mismatch sender=%x recv=%x", seed, receiver.SessionSeed())
+	}
+
 	pipe := engine.NewPipeline(engine.PipelineConfig{
 		Width: 128, Height: 128, BlockSize: 32,
-		XORSeed: engine.DefaultXORSeed,
+		XORSeed: seed,
 	})
 	defer pipe.Close()
 
@@ -69,11 +74,11 @@ func TestWebRTCHighResChunked(t *testing.T) {
 
 	const w, h = 1920, 1080
 	var got atomic.Uint64
-	rec := NewFrameReconstructor(engine.DefaultXORSeed)
+	rec := NewFrameReconstructor(1)
 	sender, receiver, err := ConnectLoopbackOpts(ctx, SessionConfig{
 		Compress:  true,
 		ChunkSize: DefaultChunkSize,
-		Seed:      engine.DefaultXORSeed,
+		OnSessionReady: func(seed uint64) { rec.SetSeed(seed) },
 		OnPacket: func(b []byte) {
 			if err := rec.Apply(b); err == nil {
 				got.Add(1)
@@ -86,9 +91,11 @@ func TestWebRTCHighResChunked(t *testing.T) {
 	defer sender.Stop()
 	defer receiver.Stop()
 
+	seed := sender.SessionSeed()
+
 	pipe := engine.NewPipeline(engine.PipelineConfig{
 		Width: w, Height: h, BlockSize: 64,
-		XORSeed: engine.DefaultXORSeed,
+		XORSeed: seed,
 	})
 	defer pipe.Close()
 

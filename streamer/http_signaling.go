@@ -14,7 +14,8 @@ import (
 )
 
 type sdpBody struct {
-	SDP string `json:"sdp"`
+	SDP    string `json:"sdp"`
+	PubKey []byte `json:"pubKey"` // X25519, 32 bytes
 }
 
 type iceBody struct {
@@ -23,11 +24,11 @@ type iceBody struct {
 }
 
 // HTTPSignalingHub is a tiny local signaling server for two peers (no cloud).
-// Set Token for Bearer/?token= auth; empty token = open (dev). Prefer loopback bind.
+// Token is required by CLI for hub/send/recv; empty Token disables auth (tests only). Prefer loopback.
 type HTTPSignalingHub struct {
 	mu        sync.Mutex
-	offer     string
-	answer    string
+	offer     SessionDesc
+	answer    SessionDesc
 	iceOffer  []ICECandidateJSON
 	iceAnswer []ICECandidateJSON
 	cond      *sync.Cond
@@ -92,10 +93,11 @@ func (h *HTTPSignalingHub) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPSignalingHub) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	h.mu.Lock()
 	st := map[string]any{
-		"hasOffer":  h.offer != "",
-		"hasAnswer": h.answer != "",
+		"hasOffer":  h.offer.SDP != "",
+		"hasAnswer": h.answer.SDP != "",
 		"iceOffer":  len(h.iceOffer),
 		"iceAnswer": len(h.iceAnswer),
+		"auth":      h.Token != "",
 	}
 	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
@@ -112,8 +114,8 @@ func (h *HTTPSignalingHub) Close() error {
 }
 
 func (h *HTTPSignalingHub) resetLocked() {
-	h.offer = ""
-	h.answer = ""
+	h.offer = SessionDesc{}
+	h.answer = SessionDesc{}
 	h.iceOffer = nil
 	h.iceAnswer = nil
 }
@@ -148,24 +150,28 @@ func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
+		if b.SDP == "" || len(b.PubKey) != 32 {
+			http.Error(w, "sdp and 32-byte pubKey required", 400)
+			return
+		}
 		h.mu.Lock()
 		h.resetLocked()
-		h.offer = b.SDP
+		h.offer = SessionDesc{SDP: b.SDP, PubKey: append([]byte(nil), b.PubKey...)}
 		h.cond.Broadcast()
 		h.mu.Unlock()
 		w.WriteHeader(204)
 	case http.MethodGet:
 		h.mu.Lock()
-		ok := h.waitCond(func() bool { return h.offer != "" }, time.Duration(MaxSignalingWaitSeconds)*time.Second)
+		ok := h.waitCond(func() bool { return h.offer.SDP != "" }, time.Duration(MaxSignalingWaitSeconds)*time.Second)
 		if !ok {
 			h.mu.Unlock()
 			http.Error(w, "timeout waiting for offer", 504)
 			return
 		}
-		sdp := h.offer
-		h.offer = ""
+		d := h.offer
+		h.offer = SessionDesc{}
 		h.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(sdpBody{SDP: sdp})
+		_ = json.NewEncoder(w).Encode(sdpBody{SDP: d.SDP, PubKey: d.PubKey})
 	case http.MethodDelete:
 		h.mu.Lock()
 		h.resetLocked()
@@ -185,23 +191,27 @@ func (h *HTTPSignalingHub) handleAnswer(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, err.Error(), 400)
 			return
 		}
+		if b.SDP == "" || len(b.PubKey) != 32 {
+			http.Error(w, "sdp and 32-byte pubKey required", 400)
+			return
+		}
 		h.mu.Lock()
-		h.answer = b.SDP
+		h.answer = SessionDesc{SDP: b.SDP, PubKey: append([]byte(nil), b.PubKey...)}
 		h.cond.Broadcast()
 		h.mu.Unlock()
 		w.WriteHeader(204)
 	case http.MethodGet:
 		h.mu.Lock()
-		ok := h.waitCond(func() bool { return h.answer != "" }, time.Duration(MaxSignalingWaitSeconds)*time.Second)
+		ok := h.waitCond(func() bool { return h.answer.SDP != "" }, time.Duration(MaxSignalingWaitSeconds)*time.Second)
 		if !ok {
 			h.mu.Unlock()
 			http.Error(w, "timeout waiting for answer", 504)
 			return
 		}
-		sdp := h.answer
-		h.answer = ""
+		d := h.answer
+		h.answer = SessionDesc{}
 		h.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(sdpBody{SDP: sdp})
+		_ = json.NewEncoder(w).Encode(sdpBody{SDP: d.SDP, PubKey: d.PubKey})
 	default:
 		http.Error(w, "method", 405)
 	}
@@ -289,17 +299,17 @@ func NewHTTPSignalingClientToken(baseURL, token string) *HTTPSignalingClient {
 	}
 }
 
-func (c *HTTPSignalingClient) SendOffer(sdp string) error {
-	return c.postJSON("/offer", sdpBody{SDP: sdp})
+func (c *HTTPSignalingClient) SendOffer(d SessionDesc) error {
+	return c.postJSON("/offer", sdpBody{SDP: d.SDP, PubKey: d.PubKey})
 }
-func (c *HTTPSignalingClient) SendAnswer(sdp string) error {
-	return c.postJSON("/answer", sdpBody{SDP: sdp})
+func (c *HTTPSignalingClient) SendAnswer(d SessionDesc) error {
+	return c.postJSON("/answer", sdpBody{SDP: d.SDP, PubKey: d.PubKey})
 }
-func (c *HTTPSignalingClient) RecvOffer(ctx context.Context) (string, error) {
-	return c.getSDP(ctx, "/offer")
+func (c *HTTPSignalingClient) RecvOffer(ctx context.Context) (SessionDesc, error) {
+	return c.getDesc(ctx, "/offer")
 }
-func (c *HTTPSignalingClient) RecvAnswer(ctx context.Context) (string, error) {
-	return c.getSDP(ctx, "/answer")
+func (c *HTTPSignalingClient) RecvAnswer(ctx context.Context) (SessionDesc, error) {
+	return c.getDesc(ctx, "/answer")
 }
 
 func (c *HTTPSignalingClient) SendICE(fromOfferer bool, cand ICECandidateJSON) error {
@@ -357,26 +367,29 @@ func (c *HTTPSignalingClient) postJSON(path string, v any) error {
 	return nil
 }
 
-func (c *HTTPSignalingClient) getSDP(ctx context.Context, path string) (string, error) {
+func (c *HTTPSignalingClient) getDesc(ctx context.Context, path string) (SessionDesc, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
 	if err != nil {
-		return "", err
+		return SessionDesc{}, err
 	}
 	c.setAuth(req)
 	res, err := c.client.Do(req)
 	if err != nil {
-		return "", err
+		return SessionDesc{}, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode == 401 {
-		return "", fmt.Errorf("signaling unauthorized (check -token)")
+		return SessionDesc{}, fmt.Errorf("signaling unauthorized (check -token)")
 	}
 	if res.StatusCode == 504 {
-		return "", fmt.Errorf("signaling %s timeout", path)
+		return SessionDesc{}, fmt.Errorf("signaling %s timeout", path)
 	}
 	var b sdpBody
 	if err := json.NewDecoder(res.Body).Decode(&b); err != nil {
-		return "", err
+		return SessionDesc{}, err
 	}
-	return b.SDP, nil
+	if b.SDP == "" || len(b.PubKey) != 32 {
+		return SessionDesc{}, fmt.Errorf("signaling %s: missing sdp/pubKey", path)
+	}
+	return SessionDesc{SDP: b.SDP, PubKey: b.PubKey}, nil
 }

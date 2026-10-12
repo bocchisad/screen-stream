@@ -101,19 +101,11 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 		p.currHashes, p.prevHashes, p.havePrev, force, p.rectScratch)
 
 	if p.detector != nil {
-		if pd, ok := p.detector.(*PatternDetector); ok {
-			hits := pd.DetectInto(p.hitScratch[:0])
-			for i := range hits {
-				r := hits[i]
+		meta.BlockSize = uint16(p.blockSize)
+		rects, err := p.detector.Detect(ctx, meta, p.plain[:need])
+		if err == nil {
+			for _, r := range rects {
 				fillBlack(p.plain, stride, int(r.X), int(r.Y), int(r.W), int(r.H))
-			}
-		} else {
-			// Pass plaintext scratch so OCR / scanners can read pixels.
-			rects, err := p.detector.Detect(ctx, meta, p.plain[:need])
-			if err == nil {
-				for _, r := range rects {
-					fillBlack(p.plain, stride, int(r.X), int(r.Y), int(r.W), int(r.H))
-				}
 			}
 		}
 	}
@@ -158,6 +150,9 @@ func (p *StreamPipeline) Process(ctx context.Context, frame *Frame) (*DirtyPacke
 	}
 	pkt.Regions = regions
 	pkt.Payload = pkt.Payload[:payloadLen]
+
+	// Wipe plaintext scratch so clear BGRA does not rest in RAM.
+	clear(p.plain[:need])
 
 	copy(p.prevHashes, p.currHashes)
 	p.havePrev = true
