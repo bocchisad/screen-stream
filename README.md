@@ -51,7 +51,7 @@ Exit `2` = screen permission denied.
 
 | Spec item | Status |
 |-----------|--------|
-| Zero-alloc capture pool | Process (+PixelScan) 0 alloc after warmup; OS capture may still native-malloc |
+| Zero-alloc capture pool | Process (+PixelScan) 0 Go alloc; OS path preallocs BGRA once (no per-frame malloc) |
 | macOS ScreenCaptureKit BGRA + filter | Done (bundle + window exclude) |
 | Linux X11 XShm | Done (packed BGRA normalize) |
 | Wayland PipeWire | Linked by default on Linux via pkg-config (`libpipewire`+gio); use `-tags nopipewire` without libs |

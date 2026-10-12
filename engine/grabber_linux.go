@@ -124,8 +124,9 @@ func (g *linuxGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, erro
 			select {
 			case <-ctx.Done():
 				return FrameMeta{}, ctx.Err()
-			case <-time.After(500 * time.Microsecond):
+			default:
 			}
+			time.Sleep(500 * time.Microsecond)
 			continue
 		}
 		return FrameMeta{}, fmt.Errorf("%w: capture code=%d", ErrBackendUnavailable, rc)

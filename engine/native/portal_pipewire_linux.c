@@ -286,6 +286,21 @@ static int portal_start(void) {
     }
     if (gWidth <= 0) gWidth = 1920;
     if (gHeight <= 0) gHeight = 1080;
+    /* Preallocate BGRA staging once (steady-state frames reuse). */
+    {
+        size_t need = (size_t)gWidth * (size_t)gHeight * 4;
+        pthread_mutex_lock(&gFrameMu);
+        free(gFrameBGRA);
+        gFrameBGRA = need ? (uint8_t *)malloc(need) : NULL;
+        gFrameCap = gFrameBGRA ? need : 0;
+        gFrameLen = 0;
+        gFrameReady = 0;
+        pthread_mutex_unlock(&gFrameMu);
+        if (need && !gFrameBGRA) {
+            set_err("frame buffer alloc");
+            return 2;
+        }
+    }
     gState = PW_STATE_STARTED;
     set_err(NULL);
     return 0;
@@ -312,9 +327,11 @@ static void on_stream_process(void *data) {
 
     pthread_mutex_lock(&gFrameMu);
     if (gFrameCap < need) {
-        free(gFrameBGRA);
-        gFrameBGRA = (uint8_t *)malloc(need);
-        gFrameCap = gFrameBGRA ? need : 0;
+        uint8_t *nb = (uint8_t *)realloc(gFrameBGRA, need);
+        if (nb) {
+            gFrameBGRA = nb;
+            gFrameCap = need;
+        }
     }
     if (gFrameBGRA && gFrameCap >= need) {
         const uint8_t *src = (const uint8_t *)d->data;
@@ -353,6 +370,17 @@ static void on_stream_param_changed(void *data, uint32_t id, const struct spa_po
     gFormat = info.format;
     if (info.size.width > 0) gWidth = (int)info.size.width;
     if (info.size.height > 0) gHeight = (int)info.size.height;
+    size_t need = (size_t)gWidth * (size_t)gHeight * 4;
+    if (need == 0) return;
+    pthread_mutex_lock(&gFrameMu);
+    if (gFrameCap < need) {
+        uint8_t *nb = (uint8_t *)realloc(gFrameBGRA, need);
+        if (nb) {
+            gFrameBGRA = nb;
+            gFrameCap = need;
+        }
+    }
+    pthread_mutex_unlock(&gFrameMu);
 }
 
 static const struct pw_stream_events stream_events = {

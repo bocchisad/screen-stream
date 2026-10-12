@@ -111,8 +111,9 @@ func (g *macGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, error)
 			select {
 			case <-ctx.Done():
 				return FrameMeta{}, ctx.Err()
-			case <-time.After(500 * time.Microsecond):
+			default:
 			}
+			time.Sleep(500 * time.Microsecond) // no heap (unlike time.After)
 			continue
 		}
 		return FrameMeta{}, fmt.Errorf("%w: capture code=%d", ErrBackendUnavailable, rc)

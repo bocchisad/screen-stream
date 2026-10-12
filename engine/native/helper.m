@@ -82,12 +82,15 @@ static atomic_int gFrameReady = 0;
     }
 
     [self.lock lock];
+    /* Grow only if geometry grew (rare); steady-state reuses prealloc. */
     if (!self.latest || self.latestLen < need) {
-        free(self.latest);
-        self.latest = (uint8_t *)malloc(need);
-        self.latestLen = self.latest ? need : 0;
+        uint8_t *nb = (uint8_t *)realloc(self.latest, need);
+        if (nb) {
+            self.latest = nb;
+            self.latestLen = need;
+        }
     }
-    if (self.latest && base) {
+    if (self.latest && self.latestLen >= need && base) {
         memcpy(self.latest, base, need);
         self.width = (int)w;
         self.height = (int)h;
@@ -269,6 +272,17 @@ int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, in
     gOutStride = ((outW * 4) + 63) & ~63;
 
     gDelegate = [[SSStreamDelegate alloc] init];
+    /* Preallocate once so steady-state frames never malloc. */
+    {
+        size_t pre = (size_t)gOutStride * (size_t)gOutH;
+        if (pre > 0 && pre <= (64u * 1024u * 1024u)) {
+            gDelegate.latest = (uint8_t *)malloc(pre);
+            gDelegate.latestLen = gDelegate.latest ? pre : 0;
+            gDelegate.width = outW;
+            gDelegate.height = outH;
+            gDelegate.stride = gOutStride;
+        }
+    }
     gStream = [[SCStream alloc] initWithFilter:filter configuration:cfg delegate:gDelegate];
 
     NSError *addErr = nil;
