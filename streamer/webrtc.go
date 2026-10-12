@@ -43,6 +43,8 @@ type WebRTCSession struct {
 	aeadBuf   []byte
 	seed           uint64 // session XOR seed (ECDH-derived after dial)
 	kxPriv         []byte
+	idPriv         []byte
+	idPub          []byte
 	fingerprint    string
 	stunURL        string
 	disableAEAD    bool
@@ -60,6 +62,9 @@ type SessionConfig struct {
 	STUNURL        string
 	// Seed is unused for wire keys when ECDH succeeds; kept for DisableAEAD tests.
 	Seed uint64
+	// IdentityPriv/Pub are optional static X25519 keys for stable TOFU fingerprints.
+	IdentityPriv []byte
+	IdentityPub  []byte
 }
 
 func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
@@ -82,6 +87,8 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 		seed:           cfg.Seed,
 		stunURL:        cfg.STUNURL,
 		disableAEAD:    cfg.DisableAEAD,
+		idPriv:         append([]byte(nil), cfg.IdentityPriv...),
+		idPub:          append([]byte(nil), cfg.IdentityPub...),
 		packBuf:        make([]byte, 0, 8<<20),
 		chunkBuf:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
 		sendCopy:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
@@ -123,6 +130,32 @@ func (s *WebRTCSession) setFingerprint(localPub, remotePub []byte) {
 	s.mu.Lock()
 	s.fingerprint = TranscriptHash(localPub, remotePub)
 	s.mu.Unlock()
+}
+
+func (s *WebRTCSession) sessionDesc(sdp string, ephPub []byte) SessionDesc {
+	d := SessionDesc{SDP: sdp, PubKey: ephPub}
+	if len(s.idPub) == 32 {
+		d.IdentityPub = append([]byte(nil), s.idPub...)
+	}
+	return d
+}
+
+func (s *WebRTCSession) finishKX(ephPriv, ephPub []byte, peer SessionDesc) (aeadKey []byte, xorSeed uint64, err error) {
+	localID, peerID := s.idPub, peer.IdentityPub
+	if len(localID) == 32 && len(peerID) == 32 {
+		aeadKey, xorSeed, err = DeriveSessionSecretsBound(ephPriv, peer.PubKey, localID, peerID)
+		if err != nil {
+			return nil, 0, err
+		}
+		s.setFingerprint(localID, peerID)
+		return aeadKey, xorSeed, nil
+	}
+	aeadKey, xorSeed, err = DeriveSessionSecrets(ephPriv, peer.PubKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	s.setFingerprint(ephPub, peer.PubKey)
+	return aeadKey, xorSeed, nil
 }
 
 func (s *WebRTCSession) applySessionKeys(aeadKey []byte, xorSeed uint64) error {
@@ -204,7 +237,7 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 		return err
 	}
 	<-webrtc.GatheringCompletePromise(pc)
-	if err := sig.SendOffer(SessionDesc{SDP: pc.LocalDescription().SDP, PubKey: pub}); err != nil {
+	if err := sig.SendOffer(s.sessionDesc(pc.LocalDescription().SDP, pub)); err != nil {
 		return err
 	}
 
@@ -212,11 +245,10 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	if err != nil {
 		return err
 	}
-	aeadKey, xorSeed, err := DeriveSessionSecrets(priv, ans.PubKey)
+	aeadKey, xorSeed, err := s.finishKX(priv, pub, ans)
 	if err != nil {
 		return fmt.Errorf("ecdh: %w", err)
 	}
-	s.setFingerprint(pub, ans.PubKey)
 	if err := s.applySessionKeys(aeadKey, xorSeed); err != nil {
 		return err
 	}
@@ -248,11 +280,10 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	if err != nil {
 		return err
 	}
-	aeadKey, xorSeed, err := DeriveSessionSecrets(priv, off.PubKey)
+	aeadKey, xorSeed, err := s.finishKX(priv, pub, off)
 	if err != nil {
 		return fmt.Errorf("ecdh: %w", err)
 	}
-	s.setFingerprint(pub, off.PubKey)
 	if err := s.applySessionKeys(aeadKey, xorSeed); err != nil {
 		return err
 	}
@@ -267,7 +298,7 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 		return err
 	}
 	<-webrtc.GatheringCompletePromise(pc)
-	if err := sig.SendAnswer(SessionDesc{SDP: pc.LocalDescription().SDP, PubKey: pub}); err != nil {
+	if err := sig.SendAnswer(s.sessionDesc(pc.LocalDescription().SDP, pub)); err != nil {
 		return err
 	}
 	return s.waitDC(ctx)

@@ -14,8 +14,26 @@ import (
 )
 
 type sdpBody struct {
-	SDP    string `json:"sdp"`
-	PubKey []byte `json:"pubKey"` // X25519, 32 bytes
+	SDP         string `json:"sdp"`
+	PubKey      []byte `json:"pubKey"`                // ephemeral X25519, 32 bytes
+	IdentityPub []byte `json:"identityPub,omitempty"` // static identity, 32 bytes
+}
+
+func parseSDPBody(b sdpBody) (SessionDesc, error) {
+	if b.SDP == "" || len(b.PubKey) != 32 {
+		return SessionDesc{}, fmt.Errorf("sdp and 32-byte pubKey required")
+	}
+	d := SessionDesc{SDP: b.SDP, PubKey: append([]byte(nil), b.PubKey...)}
+	if len(b.IdentityPub) == 32 {
+		d.IdentityPub = append([]byte(nil), b.IdentityPub...)
+	} else if len(b.IdentityPub) != 0 {
+		return SessionDesc{}, fmt.Errorf("identityPub must be 32 bytes")
+	}
+	return d, nil
+}
+
+func encodeSDPBody(d SessionDesc) sdpBody {
+	return sdpBody{SDP: d.SDP, PubKey: d.PubKey, IdentityPub: d.IdentityPub}
 }
 
 type iceBody struct {
@@ -210,14 +228,15 @@ func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if b.SDP == "" || len(b.PubKey) != 32 {
-			http.Error(w, "sdp and 32-byte pubKey required", 400)
+		d, err := parseSDPBody(b)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
 			return
 		}
 		h.mu.Lock()
 		s := h.slotLocked(name)
 		h.resetSlotLocked(s)
-		s.offer = SessionDesc{SDP: b.SDP, PubKey: append([]byte(nil), b.PubKey...)}
+		s.offer = d
 		h.cond.Broadcast()
 		h.mu.Unlock()
 		w.WriteHeader(204)
@@ -233,7 +252,7 @@ func (h *HTTPSignalingHub) handleOffer(w http.ResponseWriter, r *http.Request) {
 		d := s.offer
 		s.offer = SessionDesc{}
 		h.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(sdpBody{SDP: d.SDP, PubKey: d.PubKey})
+		_ = json.NewEncoder(w).Encode(encodeSDPBody(d))
 	case http.MethodDelete:
 		h.mu.Lock()
 		if s, ok := h.slots[name]; ok {
@@ -256,13 +275,14 @@ func (h *HTTPSignalingHub) handleAnswer(w http.ResponseWriter, r *http.Request) 
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if b.SDP == "" || len(b.PubKey) != 32 {
-			http.Error(w, "sdp and 32-byte pubKey required", 400)
+		d, err := parseSDPBody(b)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
 			return
 		}
 		h.mu.Lock()
 		s := h.slotLocked(name)
-		s.answer = SessionDesc{SDP: b.SDP, PubKey: append([]byte(nil), b.PubKey...)}
+		s.answer = d
 		h.cond.Broadcast()
 		h.mu.Unlock()
 		w.WriteHeader(204)
@@ -278,7 +298,7 @@ func (h *HTTPSignalingHub) handleAnswer(w http.ResponseWriter, r *http.Request) 
 		d := s.answer
 		s.answer = SessionDesc{}
 		h.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(sdpBody{SDP: d.SDP, PubKey: d.PubKey})
+		_ = json.NewEncoder(w).Encode(encodeSDPBody(d))
 	default:
 		http.Error(w, "method", 405)
 	}
@@ -387,10 +407,10 @@ func (c *HTTPSignalingClient) peerQ(path string) string {
 }
 
 func (c *HTTPSignalingClient) SendOffer(d SessionDesc) error {
-	return c.postJSON(c.peerQ("/offer"), sdpBody{SDP: d.SDP, PubKey: d.PubKey})
+	return c.postJSON(c.peerQ("/offer"), encodeSDPBody(d))
 }
 func (c *HTTPSignalingClient) SendAnswer(d SessionDesc) error {
-	return c.postJSON(c.peerQ("/answer"), sdpBody{SDP: d.SDP, PubKey: d.PubKey})
+	return c.postJSON(c.peerQ("/answer"), encodeSDPBody(d))
 }
 func (c *HTTPSignalingClient) RecvOffer(ctx context.Context) (SessionDesc, error) {
 	return c.getDesc(ctx, c.peerQ("/offer"))
@@ -483,8 +503,9 @@ func (c *HTTPSignalingClient) getDesc(ctx context.Context, path string) (Session
 	if err := json.NewDecoder(res.Body).Decode(&b); err != nil {
 		return SessionDesc{}, err
 	}
-	if b.SDP == "" || len(b.PubKey) != 32 {
-		return SessionDesc{}, fmt.Errorf("signaling %s: missing sdp/pubKey", path)
+	d, err := parseSDPBody(b)
+	if err != nil {
+		return SessionDesc{}, fmt.Errorf("signaling %s: %w", path, err)
 	}
-	return SessionDesc{SDP: b.SDP, PubKey: b.PubKey}, nil
+	return d, nil
 }

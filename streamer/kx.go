@@ -14,10 +14,11 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// SessionDesc is SDP plus an ephemeral X25519 public key for ECDH.
+// SessionDesc is SDP plus ephemeral X25519 for ECDH and optional static identity pub.
 type SessionDesc struct {
-	SDP    string
-	PubKey []byte // 32 bytes
+	SDP         string
+	PubKey      []byte // ephemeral, 32 bytes
+	IdentityPub []byte // static identity, 32 bytes (optional; enables stable TOFU)
 }
 
 // GenerateKXKeypair returns X25519 private+public (32 bytes each).
@@ -29,17 +30,23 @@ func GenerateKXKeypair() (priv, pub []byte, err error) {
 	return k.Bytes(), k.PublicKey().Bytes(), nil
 }
 
-// DeriveSessionSecrets ECDH(priv, peerPub) → AEAD key (32) + XOR seed (u64) via HKDF.
+// DeriveSessionSecrets ECDH(ephPriv, peerEph) → AEAD key + XOR seed via HKDF.
 func DeriveSessionSecrets(priv, peerPub []byte) (aeadKey []byte, xorSeed uint64, err error) {
-	if len(priv) != 32 || len(peerPub) != 32 {
-		return nil, 0, fmt.Errorf("kx: want 32-byte keys")
+	return DeriveSessionSecretsBound(priv, peerPub, nil, nil)
+}
+
+// DeriveSessionSecretsBound is ECDH on ephemeral keys; when both identity pubs are
+// present they are mixed into HKDF info so the session is bound to TOFU identities.
+func DeriveSessionSecretsBound(ephPriv, peerEph, localID, peerID []byte) (aeadKey []byte, xorSeed uint64, err error) {
+	if len(ephPriv) != 32 || len(peerEph) != 32 {
+		return nil, 0, fmt.Errorf("kx: want 32-byte ephemeral keys")
 	}
 	curve := ecdh.X25519()
-	privK, err := curve.NewPrivateKey(priv)
+	privK, err := curve.NewPrivateKey(ephPriv)
 	if err != nil {
 		return nil, 0, err
 	}
-	pubK, err := curve.NewPublicKey(peerPub)
+	pubK, err := curve.NewPublicKey(peerEph)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -47,7 +54,12 @@ func DeriveSessionSecrets(priv, peerPub []byte) (aeadKey []byte, xorSeed uint64,
 	if err != nil {
 		return nil, 0, err
 	}
-	r := hkdf.New(sha256.New, shared, []byte("screen-stream-v1"), []byte("session-v1"))
+	info := []byte("session-v1")
+	if len(localID) == 32 && len(peerID) == 32 {
+		fp := TranscriptHash(localID, peerID)
+		info = append([]byte("session-v1|id="), fp...)
+	}
+	r := hkdf.New(sha256.New, shared, []byte("screen-stream-v1"), info)
 	aeadKey = make([]byte, chacha20poly1305.KeySize)
 	if _, err := io.ReadFull(r, aeadKey); err != nil {
 		return nil, 0, err

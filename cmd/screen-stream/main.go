@@ -40,7 +40,10 @@ func main() {
 	xorSeedFlag := flag.String("xor-seed", "", "bench/local RAM XOR seed (decimal/0xHEX); P2P uses ECDH-derived seed")
 	tokenFlag := flag.String("token", "", "required auth for hub/send/recv/preview; else env SCREEN_STREAM_TOKEN")
 	stunFlag := flag.String("stun", "", "optional STUN URL (e.g. stun:stun.l.google.com:19302)")
-	expectFP := flag.String("expect-fingerprint", "", "TOFU: exit 1 if ECDH transcript hash mismatches")
+	expectFP := flag.String("expect-fingerprint", "", "exit 1 if fingerprint mismatches (overrides TOFU pin)")
+	tofuFlag := flag.String("tofu", "auto", "auto|off — pin stable identity fingerprint on send/recv")
+	tofuFile := flag.String("tofu-file", "", "TOFU pins JSON (default ~/.config/screen-stream/tofu.json)")
+	identityFlag := flag.String("identity", "", "static X25519 priv key path (default ~/.config/screen-stream/identity.key)")
 	peerFlag := flag.String("peer", "default", "hub peer slot name (recv / single send)")
 	peersFlag := flag.String("peers", "", "send fanout: comma-separated peer names (overrides -peer)")
 	captureFlag := flag.String("capture", "cpu", "capture staging: cpu | gpu-surface (experimental)")
@@ -95,6 +98,9 @@ func main() {
 		*ocr = cliOpts.ocr
 		*stunFlag = cliOpts.stun
 		*peerFlag = cliOpts.peer
+		if cliOpts.tofu != "" {
+			*tofuFlag = cliOpts.tofu
+		}
 		if len(cliOpts.peers) > 0 {
 			*peersFlag = strings.Join(cliOpts.peers, ",")
 		}
@@ -111,11 +117,17 @@ func main() {
 	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  capture=%v  ecdh=x25519  aead=chacha20poly1305  auth=%v\n",
 		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, captureMode, token != "")
 
+	tofuMode := strings.ToLower(strings.TrimSpace(*tofuFlag))
+	if tofuMode != "auto" && tofuMode != "off" {
+		fmt.Fprintf(os.Stderr, "-tofu must be auto|off\n")
+		os.Exit(1)
+	}
 	base := sessionOpts{
 		seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
 		synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
 		scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
 		seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, captureMode: captureMode,
+		tofu: tofuMode, tofuFile: *tofuFile, identityPath: *identityFlag,
 	}
 
 	switch *mode {
@@ -194,6 +206,12 @@ func runDoctor(signalAddr, token string) {
 		fmt.Println("  pipewire: linked (opt out: go build -tags nopipewire)")
 	}
 	fmt.Println("  capture staging: -capture=cpu|gpu-surface (gpu-surface = one-copy retain; SCK/PipeWire)")
+	if idPath, err := streamer.DefaultIdentityPath(); err == nil {
+		fmt.Printf("  identity_path=%s\n", idPath)
+	}
+	if tofuPath, err := streamer.DefaultTOFUPath(); err == nil {
+		fmt.Printf("  tofu_path=%s  (-tofu=auto pins identity fingerprint)\n", tofuPath)
+	}
 
 	g := engine.NewGrabber()
 	fmt.Printf("  grabber backend=%s\n", g.Backend())
@@ -266,6 +284,9 @@ type sessionOpts struct {
 	token                   string
 	stun                    string
 	expectFP                string
+	tofu                    string // auto|off
+	tofuFile                string
+	identityPath            string
 	peer                    string
 	peers                   []string
 	captureMode             engine.CaptureMode
@@ -279,6 +300,45 @@ func checkFingerprint(got, expect string) {
 	}
 	if got != expect {
 		fmt.Fprintf(os.Stderr, "fingerprint mismatch: got %s want %s\n", got, expect)
+		os.Exit(1)
+	}
+}
+
+func (o sessionOpts) withIdentity(cfg streamer.SessionConfig) streamer.SessionConfig {
+	need := o.tofu == "auto" || o.identityPath != ""
+	if !need || o.transport == "loopback" || o.transport == "local" {
+		return cfg
+	}
+	priv, pub, err := streamer.LoadOrCreateIdentity(o.identityPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "identity: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.IdentityPriv = priv
+	cfg.IdentityPub = pub
+	return cfg
+}
+
+func enforceFingerprint(o sessionOpts, signalURL, peer, fp string) {
+	checkFingerprint(fp, o.expectFP)
+	if o.tofu != "auto" || fp == "" {
+		return
+	}
+	if o.transport == "loopback" || o.transport == "local" {
+		return
+	}
+	store, err := streamer.LoadTOFUStore(o.tofuFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tofu: %v\n", err)
+		os.Exit(1)
+	}
+	key := streamer.TOFUPinKey(signalURL, peer)
+	if err := store.CheckOrPin(key, fp); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if err := store.Save(); err != nil {
+		fmt.Fprintf(os.Stderr, "tofu save: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -364,7 +424,7 @@ func runSession(o sessionOpts) {
 		}
 		o.seed = rtc.SessionSeed()
 		fp := rtc.SessionFingerprint()
-		checkFingerprint(fp, o.expectFP)
+		enforceFingerprint(o, "", "", fp)
 		defer rtc.Stop()
 		defer rtcPeer.Stop()
 		sink = rtc
@@ -383,16 +443,16 @@ func runSession(o sessionOpts) {
 			if metricsCLI == nil {
 				metricsCLI = sig
 			}
-			s := streamer.NewWebRTCSession(streamer.SessionConfig{
+			s := streamer.NewWebRTCSession(o.withIdentity(streamer.SessionConfig{
 				RingDepth: 4, Compress: o.compress, STUNURL: o.stun,
-			})
+			}))
 			if err := s.DialOfferer(dialCtx, sig); err != nil {
 				dialCancel()
 				fmt.Fprintf(os.Stderr, "dial offer peer=%s: %v\n", peer, err)
 				os.Exit(1)
 			}
 			fp := s.SessionFingerprint()
-			checkFingerprint(fp, o.expectFP)
+			enforceFingerprint(o, o.signalURL, peer, fp)
 			_ = s.StartSendLoop(context.Background())
 			sessions = append(sessions, s)
 			fmt.Printf("webrtc: send peer=%s fingerprint=%s ecdh_seed=0x%X\n", peer, fp, s.SessionSeed())
@@ -425,7 +485,7 @@ func runSession(o sessionOpts) {
 			peer = "default"
 		}
 		sig := streamer.NewHTTPSignalingClientPeer(o.signalURL, o.token, peer)
-		rtc = streamer.NewWebRTCSession(streamer.SessionConfig{
+		rtc = streamer.NewWebRTCSession(o.withIdentity(streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
 			STUNURL:   o.stun,
@@ -440,7 +500,7 @@ func runSession(o sessionOpts) {
 					maybePreview(prev, rec, &lastPrev)
 				}
 			},
-		})
+		}))
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
 		if err := rtc.DialAnswerer(dialCtx, sig); err != nil {
 			dialCancel()
@@ -451,7 +511,7 @@ func runSession(o sessionOpts) {
 		dialCancel()
 		o.seed = rtc.SessionSeed()
 		fp := rtc.SessionFingerprint()
-		checkFingerprint(fp, o.expectFP)
+		enforceFingerprint(o, o.signalURL, peer, fp)
 		defer rtc.Stop()
 		startMetricsPusher(ctx, sig, rtc)
 		fmt.Printf("webrtc: recv ← %s peer=%s ecdh_seed=0x%X fingerprint=%s\n", o.signalURL, peer, o.seed, fp)

@@ -1,4 +1,4 @@
-//go:build !darwin && !linux
+//go:build !darwin && !linux && !windows
 
 package engine
 
@@ -16,7 +16,7 @@ func (g *stubGrabber) Backend() string { return "stub" }
 func (g *stubGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 	_ = ctx
 	_ = cfg
-	return fmt.Errorf("%w: only darwin and linux are implemented", ErrNotSupported)
+	return fmt.Errorf("%w: only darwin, linux, and windows are implemented", ErrNotSupported)
 }
 
 func (g *stubGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, error) {

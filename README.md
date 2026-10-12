@@ -29,14 +29,15 @@ go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
 
 **Auth (required):** `-token` / `SCREEN_STREAM_TOKEN` for `hub` / `send` / `recv` / `-preview`.
 
-**Keys:** X25519 ECDH → ChaCha20-Poly1305 + XOR seed; `fingerprint=` is a TOFU hash of both pubs.
+**Keys:** ephemeral X25519 ECDH → ChaCha20-Poly1305 + XOR seed. With `-tofu=auto` (default on send/recv), each side also has a **static identity** key; `fingerprint=` is a stable hash of both identity pubs (pinned under `~/.config/screen-stream/tofu.json`).
 
 **Flags:**
-- `-mode=cli` — interactive terminal menu
+- `-mode=cli` — interactive terminal menu (bubbletea TUI)
 - `-capture=cpu|gpu-surface` — staging path (`gpu-surface` = retain surface/buffer, one copy into Go; still SCK/PipeWire, experimental)
 - `-stun=stun:host:port` — optional ICE STUN (no TURN/SFU)
 - `-peer` / `-peers` — hub slot(s) for multi-viewer
-- `-expect-fingerprint=HEX` — fail if ECDH transcript mismatches
+- `-tofu=auto|off` — pin identity fingerprint (default `auto`); `-tofu-file`, `-identity`
+- `-expect-fingerprint=HEX` — fail if fingerprint mismatches (also checked before TOFU pin)
 - `-pii` / `-ocr` — Vision (macOS) or Tesseract (if on PATH) + ASCII scan
 
 Hub `/status` includes `uptimeSec`, `peers`, and last POST `/metrics` counters.
@@ -47,7 +48,11 @@ Hub `/status` includes `uptimeSec`, `peers`, and last POST `/metrics` counters.
 
 OS screen recording APIs → CPU BGRA (not raw GPU VRAM). See [GPU notes](docs/superpowers/specs/2026-10-12-gpu-vram-capture-notes.md).
 
-`gpu-surface`: macOS retains `CVPixelBuffer`; Linux PipeWire holds the mapped buffer and copies once into the Go dst (skips intermediate staging). Still the same OS screen APIs — not foreign VRAM.
+| OS | Backend |
+|----|---------|
+| macOS | ScreenCaptureKit (`gpu-surface` retains `CVPixelBuffer`) |
+| Linux | XShm / PipeWire (`gpu-surface` holds mapped PW buffer) |
+| Windows | GDI BitBlt/StretchBlt (`gpu-surface` → DXGI Desktop Duplication later) |
 
 ## Specs / plan
 

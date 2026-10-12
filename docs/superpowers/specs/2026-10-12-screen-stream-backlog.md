@@ -1,16 +1,21 @@
 # screen-stream backlog
 
-## Soft gaps
+## Soft gaps — DONE
 
-1. ~~Async OCR: SyncFirst + detached timeout context~~
-2. ~~Linux `gpu-surface`: hold PipeWire mapped buffer → one copy into Go dst~~
-3. ~~Pipeline: hash/redact/pack in-place on `frame.Pixels`, XOR wipe at end~~
-4. ~~Doctor/docs: `-tags nopipewire` / missing libpipewire rebuild hint~~
-5. ~~Smoke tests~~
+Async OCR, Linux gpu-surface hold, pipeline in-place, PipeWire doctor, smoke.
 
-## Future
+## Now / recently done
 
-- DMA-BUF past Go heap, GPU encode, Noise TOFU UI, bubbletea TUI, Windows DXGI
+1. ~~Stable identity + TOFU pin store~~
+2. ~~bubbletea TUI~~
+3. ~~Windows GDI capture~~ (DXGI Desktop Duplication still pending for `-capture=gpu-surface`)
+
+## Deferred (order matters)
+
+- Windows DXGI Desktop Duplication (replace GDI for `gpu-surface`)
+- **DMA past Go** needs **GPU encode** first
+- GPU encode (H.264/NVENC)
+- Full Noise IK
 
 ## Non-goals
 
