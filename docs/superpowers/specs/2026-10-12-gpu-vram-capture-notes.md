@@ -6,7 +6,12 @@
 
 Frames come from **OS screen-capture APIs** (SCK / XShm / PipeWire). We never map other processes’ GPU textures.
 
-`-capture=gpu-surface`: macOS retains `CVPixelBuffer`; Linux PipeWire **holds** the mapped stream buffer and copies once into the Go destination (skips the intermediate BGRA staging buffer). Still portal/SCK-visible — not stealth / not foreign VRAM.
+`-capture=gpu-surface`:
+- **macOS** — retains `CVPixelBuffer`, one copy into Go
+- **Linux** — holds mapped PipeWire buffer, one copy into Go
+- **Windows** — DXGI Desktop Duplication (D3D11 staging → BGRA); `cpu` stays GDI BitBlt
+
+Still OS screen-capture APIs — not stealth / not foreign VRAM.
 
 ## What “from VRAM” would mean
 

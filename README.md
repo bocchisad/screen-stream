@@ -52,7 +52,7 @@ OS screen recording APIs → CPU BGRA (not raw GPU VRAM). See [GPU notes](docs/s
 |----|---------|
 | macOS | ScreenCaptureKit (`gpu-surface` retains `CVPixelBuffer`) |
 | Linux | XShm / PipeWire (`gpu-surface` holds mapped PW buffer) |
-| Windows | GDI BitBlt/StretchBlt (`gpu-surface` → DXGI Desktop Duplication later) |
+| Windows | `cpu` = GDI BitBlt/StretchBlt; `gpu-surface` = DXGI Desktop Duplication (D3D11 staging → BGRA) |
 
 ## Specs / plan
 

@@ -1,21 +1,13 @@
 # screen-stream backlog
 
-## Soft gaps — DONE
+## Done
 
-Async OCR, Linux gpu-surface hold, pipeline in-place, PipeWire doctor, smoke.
+- Soft gaps, identity+TOFU, bubbletea TUI, Windows GDI, **Windows DXGI** (`-capture=gpu-surface`)
 
-## Now / recently done
+## Next
 
-1. ~~Stable identity + TOFU pin store~~
-2. ~~bubbletea TUI~~
-3. ~~Windows GDI capture~~ (DXGI Desktop Duplication still pending for `-capture=gpu-surface`)
-
-## Deferred (order matters)
-
-- Windows DXGI Desktop Duplication (replace GDI for `gpu-surface`)
-- **DMA past Go** needs **GPU encode** first
-- GPU encode (H.264/NVENC)
-- Full Noise IK
+1. GPU encode (H.264/NVENC) → then DMA past Go
+2. Full Noise IK
 
 ## Non-goals
 
