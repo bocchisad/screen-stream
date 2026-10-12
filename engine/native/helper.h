@@ -36,6 +36,9 @@ int ss_mac_set_exclude_bundle(const char *bundle_id);
 int ss_mac_set_exclude_window(uint32_t window_id);
 int ss_mac_clear_excludes(void);
 
+/* 0 = cpu staging (default), 1 = gpu-surface: retain CVPixelBuffer, one copy into dst */
+int ss_mac_set_capture_mode(int mode);
+
 #ifdef __cplusplus
 }
 #endif

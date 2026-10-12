@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "bench", "bench | hub | send | recv | loopback | doctor")
+	mode := flag.String("mode", "bench", "bench | hub | send | recv | loopback | doctor | cli")
 	signalAddr := flag.String("signal", "127.0.0.1:8787", "signaling listen/dial host:port")
 	seconds := flag.Float64("seconds", 3, "run duration (bench/send/recv/loopback)")
 	fps := flag.Int("fps", 60, "target FPS")
@@ -43,12 +43,22 @@ func main() {
 	expectFP := flag.String("expect-fingerprint", "", "TOFU: exit 1 if ECDH transcript hash mismatches")
 	peerFlag := flag.String("peer", "default", "hub peer slot name (recv / single send)")
 	peersFlag := flag.String("peers", "", "send fanout: comma-separated peer names (overrides -peer)")
+	captureFlag := flag.String("capture", "cpu", "capture staging: cpu | gpu-surface (experimental)")
 	// legacy alias
 	webrtcAlias := flag.Bool("webrtc", false, "alias for -mode=loopback")
 	flag.Parse()
 
 	if *webrtcAlias && *mode == "bench" {
 		*mode = "loopback"
+	}
+
+	captureMode, err := engine.ParseCaptureMode(*captureFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if captureMode == engine.CaptureGPUSurface {
+		fmt.Fprintln(os.Stderr, "WARN: -capture=gpu-surface is EXPERIMENTAL — still ScreenCaptureKit/PipeWire (same OS visibility); at your own risk")
 	}
 
 	seed := engine.DefaultXORSeed
@@ -64,6 +74,32 @@ func main() {
 	}
 	token := streamer.ResolveAuthToken(*tokenFlag)
 
+	var cliOpts sessionOpts
+	if *mode == "cli" {
+		var addr string
+		*mode, cliOpts, addr = runCLI()
+		*signalAddr = addr
+		token = cliOpts.token
+		seed = cliOpts.seed
+		if seed == 0 {
+			seed = engine.ResolveXORSeed(0)
+		}
+		captureMode = cliOpts.captureMode
+		*preview = cliOpts.preview
+		*seconds = cliOpts.seconds
+		*fps = cliOpts.fps
+		*scale = cliOpts.scale
+		*synthetic = cliOpts.synthetic
+		*compress = cliOpts.compress
+		*pii = cliOpts.pii
+		*ocr = cliOpts.ocr
+		*stunFlag = cliOpts.stun
+		*peerFlag = cliOpts.peer
+		if len(cliOpts.peers) > 0 {
+			*peersFlag = strings.Join(cliOpts.peers, ",")
+		}
+	}
+
 	needToken := *mode == "hub" || *mode == "send" || *mode == "recv" || *preview != ""
 	if needToken {
 		if err := streamer.RequireAuthToken(token); err != nil {
@@ -72,8 +108,15 @@ func main() {
 		}
 	}
 
-	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  ecdh=x25519  aead=chacha20poly1305  auth=%v\n",
-		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, token != "")
+	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  capture=%v  ecdh=x25519  aead=chacha20poly1305  auth=%v\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, captureMode, token != "")
+
+	base := sessionOpts{
+		seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
+		synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
+		scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
+		seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, captureMode: captureMode,
+	}
 
 	switch *mode {
 	case "hub":
@@ -81,40 +124,30 @@ func main() {
 	case "doctor":
 		runDoctor(*signalAddr, token)
 	case "bench":
-		runSession(sessionOpts{
-			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
-			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
-			seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, transport: "local",
-		})
+		base.transport = "local"
+		runSession(base)
 	case "loopback":
-		runSession(sessionOpts{
-			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
-			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
-			seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP,
-			snapshot: *snapshot, preview: *preview, transport: "loopback",
-		})
+		base.snapshot = *snapshot
+		base.preview = *preview
+		base.transport = "loopback"
+		runSession(base)
 	case "send":
 		peers := splitCSV(*peersFlag)
 		if len(peers) == 0 {
 			peers = []string{*peerFlag}
 		}
-		runSession(sessionOpts{
-			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
-			synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
-			scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
-			seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, peers: peers,
-			transport: "send", signalURL: "http://" + *signalAddr,
-		})
+		base.peers = peers
+		base.transport = "send"
+		base.signalURL = "http://" + *signalAddr
+		runSession(base)
 	case "recv":
-		runSession(sessionOpts{
-			seconds: *seconds, fps: *fps, width: *width, height: *height, block: *block,
-			synthetic: true,
-			compress: *compress, seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP,
-			peer: *peerFlag, snapshot: *snapshot, preview: *preview,
-			transport: "recv", signalURL: "http://" + *signalAddr,
-		})
+		base.synthetic = true
+		base.peer = *peerFlag
+		base.snapshot = *snapshot
+		base.preview = *preview
+		base.transport = "recv"
+		base.signalURL = "http://" + *signalAddr
+		runSession(base)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown -mode %q\n", *mode)
 		os.Exit(1)
@@ -229,6 +262,7 @@ type sessionOpts struct {
 	expectFP                string
 	peer                    string
 	peers                   []string
+	captureMode             engine.CaptureMode
 	transport               string // local | loopback | send | recv
 	signalURL               string
 }
@@ -444,6 +478,7 @@ func runSession(o sessionOpts) {
 	cfg := engine.CaptureConfig{
 		FPS: o.fps, BlockSize: uint16(o.block),
 		ScalePercent: o.scale, MaxWidth: o.maxW, MaxHeight: o.maxH,
+		Mode: o.captureMode,
 	}
 	if o.exclude != "" {
 		cfg.ExcludeBundleIDs = splitCSV(o.exclude)

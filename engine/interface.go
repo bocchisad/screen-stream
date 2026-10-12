@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -114,6 +115,17 @@ type OutputSizer interface {
 	OutputSize() (width, height, stride int, ok bool)
 }
 
+// CaptureMode selects how frames are staged from the OS screen API.
+type CaptureMode int
+
+const (
+	// CaptureCPU copies via a CPU staging buffer (default, two copies on macOS).
+	CaptureCPU CaptureMode = iota
+	// CaptureGPUSurface retains CVPixelBuffer/IOSurface and copies once into the pool.
+	// Still uses ScreenCaptureKit / PipeWire — experimental, same OS visibility.
+	CaptureGPUSurface
+)
+
 // CaptureConfig controls capture session.
 type CaptureConfig struct {
 	DisplayIndex int
@@ -127,6 +139,19 @@ type CaptureConfig struct {
 	// MaxWidth / MaxHeight cap output (0 = unlimited). Applied after scale.
 	MaxWidth  int
 	MaxHeight int
+	Mode      CaptureMode
+}
+
+// ParseCaptureMode maps "cpu" | "gpu-surface" | "gpu_surface".
+func ParseCaptureMode(s string) (CaptureMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "cpu":
+		return CaptureCPU, nil
+	case "gpu-surface", "gpu_surface", "gpu", "iosurface":
+		return CaptureGPUSurface, nil
+	default:
+		return CaptureCPU, fmt.Errorf("unknown capture mode %q (cpu|gpu-surface)", s)
+	}
 }
 
 // Pipeline turns successive frames into DirtyPackets (diff, protect, redact).

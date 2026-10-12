@@ -27,7 +27,12 @@ func newPlatformGrabber() Grabber {
 	return &macGrabber{}
 }
 
-func (g *macGrabber) Backend() string { return "screencapturekit" }
+func (g *macGrabber) Backend() string {
+	if g.cfg.Mode == CaptureGPUSurface {
+		return "screencapturekit+gpu-surface"
+	}
+	return "screencapturekit"
+}
 
 func (g *macGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 	_ = ctx
@@ -40,6 +45,11 @@ func (g *macGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 		cfg.ScalePercent = 100
 		g.cfg.ScalePercent = 100
 	}
+	mode := 0
+	if cfg.Mode == CaptureGPUSurface {
+		mode = 1
+	}
+	C.ss_mac_set_capture_mode(C.int(mode))
 	C.ss_mac_clear_excludes()
 	for _, bid := range cfg.ExcludeBundleIDs {
 		cBid := C.CString(bid)

@@ -31,7 +31,9 @@ go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
 
 **Keys:** X25519 ECDH → ChaCha20-Poly1305 + XOR seed; `fingerprint=` is a TOFU hash of both pubs.
 
-**v1.1 flags:**
+**Flags:**
+- `-mode=cli` — interactive terminal menu
+- `-capture=cpu|gpu-surface` — staging path (`gpu-surface` = retain CVPixelBuffer, one copy; still SCK/PipeWire, experimental)
 - `-stun=stun:host:port` — optional ICE STUN (no TURN/SFU)
 - `-peer` / `-peers` — hub slot(s) for multi-viewer
 - `-expect-fingerprint=HEX` — fail if ECDH transcript mismatches

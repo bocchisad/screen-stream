@@ -39,10 +39,12 @@ static void ss_native_size(SCDisplay *display, int *outW, int *outH) {
 }
 
 static atomic_int gFrameReady = 0;
+static atomic_int gCaptureMode = 0; /* 0=cpu staging, 1=gpu-surface retain PB */
 
 @interface SSStreamDelegate : NSObject <SCStreamOutput, SCStreamDelegate>
 @property (nonatomic, assign) uint8_t *latest;
 @property (nonatomic, assign) size_t latestLen;
+@property (nonatomic, assign) CVPixelBufferRef latestPB; /* gpu-surface mode */
 @property (nonatomic, assign) int width;
 @property (nonatomic, assign) int height;
 @property (nonatomic, assign) int stride;
@@ -53,6 +55,7 @@ static atomic_int gFrameReady = 0;
 - (instancetype)init {
     if ((self = [super init])) {
         _lock = [[NSLock alloc] init];
+        _latestPB = NULL;
         atomic_store(&gFrameReady, 0);
     }
     return self;
@@ -65,24 +68,37 @@ static atomic_int gFrameReady = 0;
     CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) return;
 
-    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
     size_t w = CVPixelBufferGetWidth(imageBuffer);
     size_t h = CVPixelBufferGetHeight(imageBuffer);
     size_t stride = CVPixelBufferGetBytesPerRow(imageBuffer);
-    void *base = CVPixelBufferGetBaseAddress(imageBuffer);
     if (w == 0 || h == 0 || stride == 0 || stride > (SIZE_MAX / h)) {
-        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
         return;
     }
     size_t need = stride * h;
-    /* Cap ~64 MiB single frame */
     if (need > (64u * 1024u * 1024u)) {
-        CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
         return;
     }
 
+    int mode = atomic_load(&gCaptureMode);
+    if (mode == 1) {
+        /* Retain CVPixelBuffer (often IOSurface-backed); copy once in ss_mac_capture. */
+        CVPixelBufferRetain(imageBuffer);
+        [self.lock lock];
+        if (self.latestPB) {
+            CVPixelBufferRelease(self.latestPB);
+        }
+        self.latestPB = imageBuffer;
+        self.width = (int)w;
+        self.height = (int)h;
+        self.stride = (int)stride;
+        atomic_store(&gFrameReady, 1);
+        [self.lock unlock];
+        return;
+    }
+
+    CVPixelBufferLockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
+    void *base = CVPixelBufferGetBaseAddress(imageBuffer);
     [self.lock lock];
-    /* Grow only if geometry grew (rare); steady-state reuses prealloc. */
     if (!self.latest || self.latestLen < need) {
         uint8_t *nb = (uint8_t *)realloc(self.latest, need);
         if (nb) {
@@ -106,6 +122,10 @@ static atomic_int gFrameReady = 0;
     free(_latest);
     _latest = NULL;
     _latestLen = 0;
+    if (_latestPB) {
+        CVPixelBufferRelease(_latestPB);
+        _latestPB = NULL;
+    }
     [_lock unlock];
 }
 
@@ -272,8 +292,8 @@ int ss_mac_start_ex(int display_index, int fps, int scale_percent, int max_w, in
     gOutStride = ((outW * 4) + 63) & ~63;
 
     gDelegate = [[SSStreamDelegate alloc] init];
-    /* Preallocate once so steady-state frames never malloc. */
-    {
+    /* CPU mode: preallocate staging once. GPU-surface mode retains CVPixelBuffer instead. */
+    if (atomic_load(&gCaptureMode) == 0) {
         size_t pre = (size_t)gOutStride * (size_t)gOutH;
         if (pre > 0 && pre <= (64u * 1024u * 1024u)) {
             gDelegate.latest = (uint8_t *)malloc(pre);
@@ -311,6 +331,11 @@ int ss_mac_output_size(int *out_w, int *out_h, int *out_stride) {
     return 0;
 }
 
+int ss_mac_set_capture_mode(int mode) {
+    atomic_store(&gCaptureMode, mode == 1 ? 1 : 0);
+    return 0;
+}
+
 int ss_mac_stop(void) {
     if (!gStream) return 0;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -320,7 +345,6 @@ int ss_mac_stop(void) {
     }];
     dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
     gStream = nil;
-    /* ARC dealloc frees latest via -dealloc */
     gDelegate = nil;
     gOutW = gOutH = gOutStride = 0;
     atomic_store(&gFrameReady, 0);
@@ -343,13 +367,42 @@ int ss_mac_capture(uint8_t *dst, int dst_len, ss_frame_info *info) {
         return 3;
     }
     size_t need = (size_t)stride * (size_t)h;
-    if (need > (size_t)dst_len || !gDelegate.latest) {
+    if (need > (size_t)dst_len) {
         [gDelegate.lock unlock];
         return 3;
     }
-    memcpy(dst, gDelegate.latest, need);
-    atomic_store(&gFrameReady, 0);
-    [gDelegate.lock unlock];
+
+    int mode = atomic_load(&gCaptureMode);
+    if (mode == 1) {
+        CVPixelBufferRef pb = gDelegate.latestPB;
+        if (!pb) {
+            [gDelegate.lock unlock];
+            return 3;
+        }
+        CVPixelBufferRetain(pb);
+        atomic_store(&gFrameReady, 0);
+        [gDelegate.lock unlock];
+
+        CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        void *base = CVPixelBufferGetBaseAddress(pb);
+        if (!base) {
+            CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+            CVPixelBufferRelease(pb);
+            return 3;
+        }
+        memcpy(dst, base, need);
+        CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferRelease(pb);
+    } else {
+        if (!gDelegate.latest) {
+            [gDelegate.lock unlock];
+            return 3;
+        }
+        memcpy(dst, gDelegate.latest, need);
+        atomic_store(&gFrameReady, 0);
+        [gDelegate.lock unlock];
+    }
+
     info->width = w;
     info->height = h;
     info->stride = stride;

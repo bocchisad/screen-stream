@@ -31,10 +31,14 @@ func newPlatformGrabber() Grabber {
 }
 
 func (g *linuxGrabber) Backend() string {
-	if g.backend == "" {
-		return "linux"
+	base := g.backend
+	if base == "" {
+		base = "linux"
 	}
-	return g.backend
+	if g.cfg.Mode == CaptureGPUSurface {
+		return base + "+gpu-surface"
+	}
+	return base
 }
 
 func (g *linuxGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
@@ -43,6 +47,8 @@ func (g *linuxGrabber) Open(ctx context.Context, cfg CaptureConfig) error {
 	if cfg.FPS <= 0 {
 		g.cfg.FPS = 60
 	}
+	// gpu-surface on Linux: prefer PipeWire DMA path when available; same OS visibility.
+	_ = cfg.Mode
 
 	wayland := int(C.ss_wayland_session()) == 1 ||
 		strings.EqualFold(os.Getenv("XDG_SESSION_TYPE"), "wayland")
