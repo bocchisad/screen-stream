@@ -35,7 +35,7 @@ func NewPatternDetector() *PatternDetector {
 		patterns:    compiled,
 		PixelScan:   true,
 		outScratch:  make([]Rect, 0, 32),
-		textScratch: make([]byte, 0, 256),
+		textScratch: make([]byte, 0, 4096),
 	}
 }
 
@@ -49,7 +49,7 @@ func (d *PatternDetector) Detect(ctx context.Context, meta FrameMeta, plaintextB
 		out = append(out, d.LayoutHits...)
 	}
 	if d.PixelScan && len(plaintextBGRA) > 0 {
-		out, d.textScratch = scanBGRASecrets(plaintextBGRA, meta, d.patterns, out, d.textScratch)
+		out, d.textScratch = scanBGRASecrets(plaintextBGRA, meta, out, d.textScratch)
 	}
 	d.outScratch = out
 	return out, nil

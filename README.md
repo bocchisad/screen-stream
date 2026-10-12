@@ -41,8 +41,7 @@ go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
 `-xor-seed` only for local `bench`.
 
 Useful flags:
-- `-pii` — PatternDetector (ASCII-luminance + layout hits)
-- `-ocr` — Vision OCR → pattern redaction (macOS)
+- `-pii` / `-ocr` — on-device redaction (Vision OCR on macOS + ASCII/pattern scan)
 - `-exclude` / `-exclude-window` — macOS share-set filters
 - `-preview=host:port` — MJPEG on recv/loopback
 
@@ -52,19 +51,19 @@ Exit `2` = screen permission denied.
 
 | Spec item | Status |
 |-----------|--------|
-| Zero-alloc capture pool | **Process** hot path 0 alloc (CI test); full capture loop may still malloc (native frame) |
+| Zero-alloc capture pool | Process (+PixelScan) 0 alloc after warmup; OS capture may still native-malloc |
 | macOS ScreenCaptureKit BGRA + filter | Done (bundle + window exclude) |
 | Linux X11 XShm | Done (packed BGRA normalize) |
-| Wayland PipeWire | Done when built `-DSS_HAVE_PIPEWIRE=1` (portal Session→Start + pw_stream BGRA/RGBA); default build returns unavailable |
+| Wayland PipeWire | Linked by default on Linux via pkg-config (`libpipewire`+gio); use `-tags nopipewire` without libs |
 | OutputSize API | Done |
 | Frame diff + dirty boxes | Done |
-| RAM XOR protect | Done; plaintext scratch cleared after Process |
-| PII masking | PatternDetector pixel ASCII + LayoutHits; glyphs need `-ocr` |
+| RAM XOR protect | Done; pipeline plain + OCR async scratch cleared |
+| PII masking | `-pii`/`-ocr` → Vision (frame-1 sync) + ASCII pixel scan |
 | WebRTC DataChannel | Done (SSCH + zlib + AEAD) |
 | P2P without cloud SFU | Done (hub + mandatory token + ECDH) |
 | Session key exchange | Done (X25519 + HKDF) |
 | Viewer UI | MJPEG + PNG |
-| FHD p99 &lt; 10ms | CI soft gate on synthetic Process; live high-res may auto `-block=128` |
+| FHD p99 &lt; 10ms | CI: Process + Capture+Process (synthetic); live high-res may auto `-block=128` |
 | Doctor | `-mode=doctor` |
 | GPU / video encode | Not in v0 |
 

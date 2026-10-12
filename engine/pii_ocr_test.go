@@ -26,6 +26,7 @@ func TestOCRDetectorAsyncHits(t *testing.T) {
 		Rect: Rect{X: 0, Y: 0, W: 120, H: 24},
 	}}}
 	d := NewOCRDetector(fake)
+	d.SyncFirst = false
 	d.Every = 1
 	bgra := make([]byte, 64*64*4)
 	meta := FrameMeta{Width: 64, Height: 64, Stride: 256, BlockSize: 32}

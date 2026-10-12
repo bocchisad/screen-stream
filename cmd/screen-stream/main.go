@@ -27,8 +27,8 @@ func main() {
 	height := flag.Int("height", 1080, "synthetic height")
 	block := flag.Int("block", 64, "diff block size")
 	synthetic := flag.Bool("synthetic", true, "synthetic frames (send/bench/loopback)")
-	pii := flag.Bool("pii", false, "enable PII pattern redaction (demo corner hit when no OCR)")
-	ocr := flag.Bool("ocr", false, "use OCRDetector (Vision on macOS)")
+	pii := flag.Bool("pii", false, "PII redaction (Vision OCR on macOS + pattern/ASCII scan)")
+	ocr := flag.Bool("ocr", false, "same as -pii (Vision OCR when available)")
 	compress := flag.Bool("compress", true, "zlib payloads on WebRTC")
 	scale := flag.Int("scale", 100, "capture scale percent (100 = Retina pixels)")
 	maxW := flag.Int("max-width", 0, "cap capture width")
@@ -142,6 +142,7 @@ func runDoctor(signalAddr, token string) {
 	fmt.Println("screen-stream doctor")
 	fmt.Printf("  go=%s  os=%s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("  auth env %s set=%v\n", streamer.EnvAuthToken, token != "")
+	fmt.Printf("  ocr_available=%v  pipewire_builtin=%v\n", engine.OCRAvailable(), engine.PipeWireBuiltIn())
 
 	g := engine.NewGrabber()
 	fmt.Printf("  grabber backend=%s\n", g.Backend())
@@ -409,10 +410,13 @@ func runSession(o sessionOpts) {
 	}
 
 	var detector engine.PIIDetector
-	if o.ocr {
-		detector = engine.NewOCRDetector(engine.NewVisionOCRBackend())
-	} else if o.pii {
-		detector = engine.NewPatternDetector() // ASCII-luminance + LayoutHits; use -ocr for glyphs
+	if o.ocr || o.pii {
+		detector = engine.NewDefaultPIIDetector()
+		if engine.OCRAvailable() {
+			fmt.Println("pii: Vision OCR + pattern scan")
+		} else {
+			fmt.Println("pii: pattern/ASCII scan (OCR unavailable on this build)")
+		}
 	}
 
 	pipe := engine.NewPipeline(engine.PipelineConfig{

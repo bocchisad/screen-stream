@@ -9,6 +9,7 @@ import (
 type SyntheticGrabber struct {
 	Width, Height int
 	FPS           int
+	NoPace        bool // skip FPS sleep (latency benches)
 	frameID       uint64
 	t0            time.Time
 }
@@ -65,15 +66,17 @@ func (g *SyntheticGrabber) Capture(ctx context.Context, dst []byte) (FrameMeta, 
 		}
 	}
 	// Pace toward target FPS (Sleep is fine outside zero-alloc claims for OS path).
-	target := time.Second / time.Duration(g.FPS)
-	elapsed := time.Since(g.t0)
-	ideal := time.Duration(g.frameID) * target
-	if ideal > elapsed {
-		select {
-		case <-ctx.Done():
-			return FrameMeta{}, ctx.Err()
-		default:
-			time.Sleep(ideal - elapsed)
+	if !g.NoPace {
+		target := time.Second / time.Duration(g.FPS)
+		elapsed := time.Since(g.t0)
+		ideal := time.Duration(g.frameID) * target
+		if ideal > elapsed {
+			select {
+			case <-ctx.Done():
+				return FrameMeta{}, ctx.Err()
+			default:
+				time.Sleep(ideal - elapsed)
+			}
 		}
 	}
 	return FrameMeta{
