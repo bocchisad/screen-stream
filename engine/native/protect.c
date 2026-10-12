@@ -39,7 +39,15 @@ void ss_block_hashes(
             for (int y = y0; y < y1; y++) {
                 const uint8_t *row = bgra + (size_t)y * (size_t)stride + (size_t)x0 * 4;
                 int nbytes = (x1 - x0) * 4;
-                for (int i = 0; i < nbytes; i++) {
+                int i = 0;
+                /* Word-sized FNV — same mixing, far fewer ops on FHD/Retina. */
+                for (; i + 8 <= nbytes; i += 8) {
+                    uint64_t w;
+                    memcpy(&w, row + i, 8);
+                    h ^= w;
+                    h *= 1099511628211ULL;
+                }
+                for (; i < nbytes; i++) {
                     h ^= row[i];
                     h *= 1099511628211ULL;
                 }

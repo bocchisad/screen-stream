@@ -301,18 +301,25 @@ func runSession(o sessionOpts) {
 	fmt.Printf("backend=%s  geometry=%dx%d  stride=%d  scale=%d%%\n",
 		grabber.Backend(), w, h, stride, o.scale)
 
+	// High-res: larger blocks cut hash/diff work (TZ p99 target is FHD@64).
+	block := o.block
+	if block == 64 && w*h > 1920*1080 {
+		block = 128
+		fmt.Printf("auto block=%d (high-res; override with -block)\n", block)
+	}
+
 	var detector engine.PIIDetector
 	if o.ocr {
 		detector = engine.NewOCRDetector(engine.NewVisionOCRBackend())
 	} else if o.pii {
 		pd := engine.NewPatternDetector()
 		// Explicit demo mask only when -pii is on (top-left block).
-		pd.SetHits([]engine.Rect{{X: 0, Y: 0, W: uint16(o.block), H: uint16(o.block)}})
+		pd.SetHits([]engine.Rect{{X: 0, Y: 0, W: uint16(block), H: uint16(block)}})
 		detector = pd
 	}
 
 	pipe := engine.NewPipeline(engine.PipelineConfig{
-		Width: w, Height: h, Stride: stride, BlockSize: o.block,
+		Width: w, Height: h, Stride: stride, BlockSize: block,
 		Detector: detector, XORSeed: o.seed,
 	})
 	defer pipe.Close()

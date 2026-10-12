@@ -53,17 +53,20 @@ Exit `2` = screen permission denied.
 
 | Spec item | Status |
 |-----------|--------|
-| Zero-alloc capture pool | Done (engine freelist) |
+| Zero-alloc capture pool | Done (engine freelist; PacketPool non-blocking) |
 | macOS ScreenCaptureKit BGRA + filter | Done (Retina native) |
 | Linux X11 XShm | Done |
 | Wayland PipeWire | State-machine skeleton; full portal needs `-DSS_HAVE_PIPEWIRE=1` |
-| Frame diff + dirty boxes | Done (C via cgo, pure Go fallback) |
+| Frame diff + dirty boxes | Done (word-sized FNV hash; horizontal run merge) |
 | RAM XOR protect | Done (C via cgo) |
-| PII masking | PatternDetector + OCRDetector; Vision backend on macOS (`-ocr`) |
-| WebRTC DataChannel | Done (chunked SSCH + zlib + buffer pool) |
-| P2P without cloud SFU | Done (local hub signaling) |
+| PII masking | PatternDetector + Luhn PANs + OCR/Vision (`-ocr`) |
+| WebRTC DataChannel | Done (chunked SSCH + pooled zlib) |
+| P2P without cloud SFU | Done (local hub; `/` help page + `/status`) |
 | Viewer UI | MJPEG `-preview` + PNG `-snapshot` |
+| FHD p99 &lt; 10ms | Best-effort; high-res auto `-block=128`; use `-scale=50` / `-compress=false` if needed |
 | GPU / video encode | Not in v0 |
+
+**Preview URL:** `http://127.0.0.1:8090/` (recv). Hub `:8787` is signaling only.
 
 ## Layout
 

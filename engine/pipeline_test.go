@@ -38,3 +38,16 @@ func TestPatternScan(t *testing.T) {
 		t.Fatal("expected hit for ghp_ token")
 	}
 }
+
+func TestLuhnCard(t *testing.T) {
+	d := NewPatternDetector()
+	// Visa test PAN (passes Luhn)
+	ok := d.ScanText("card 4111111111111111", Rect{X: 0, Y: 0, W: 200, H: 20}, 64)
+	if len(ok) == 0 {
+		t.Fatal("expected Luhn-valid PAN hit")
+	}
+	bad := d.ScanText("card 4111111111111112", Rect{X: 0, Y: 0, W: 200, H: 20}, 64)
+	if len(bad) != 0 {
+		t.Fatal("Luhn-invalid PAN must not hit")
+	}
+}

@@ -41,6 +41,7 @@ func NewHTTPSignalingHub() *HTTPSignalingHub {
 
 func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", h.handleIndex)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 	mux.HandleFunc("/status", h.handleStatus)
 	mux.HandleFunc("/offer", h.handleOffer)
@@ -66,6 +67,20 @@ func (h *HTTPSignalingHub) ListenAndServe(addr string) (string, error) {
 }
 
 func (h *HTTPSignalingHub) Addr() string { return h.addr }
+
+func (h *HTTPSignalingHub) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = fmt.Fprintf(w, `<!doctype html><title>screen-stream hub</title>
+<body style="font:14px/1.4 system-ui;max-width:40rem;margin:2rem;background:#111;color:#ddd">
+<h1>signaling hub</h1>
+<p>This is <b>not</b> the live preview. Preview is on recv: <code>http://127.0.0.1:8090/</code></p>
+<p>API: <a href="/status">/status</a> · <code>/offer</code> · <code>/answer</code> · <code>/ice</code> · <code>/health</code></p>
+</body>`)
+}
 
 func (h *HTTPSignalingHub) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	h.mu.Lock()

@@ -47,8 +47,15 @@ func blockHashes(bgra []byte, width, height, stride, blockSize int, out []uint64
 			h := uint64(14695981039346656037)
 			for y := y0; y < y1; y++ {
 				row := bgra[y*stride+x0*4 : y*stride+x1*4]
-				for _, b := range row {
-					h ^= uint64(b)
+				i := 0
+				for ; i+8 <= len(row); i += 8 {
+					w := uint64(row[i]) | uint64(row[i+1])<<8 | uint64(row[i+2])<<16 | uint64(row[i+3])<<24 |
+						uint64(row[i+4])<<32 | uint64(row[i+5])<<40 | uint64(row[i+6])<<48 | uint64(row[i+7])<<56
+					h ^= w
+					h *= 1099511628211
+				}
+				for ; i < len(row); i++ {
+					h ^= uint64(row[i])
 					h *= 1099511628211
 				}
 			}

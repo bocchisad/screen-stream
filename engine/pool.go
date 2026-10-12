@@ -84,7 +84,23 @@ func NewPacketPool(payloadSize, maxRegions int) *PacketPool {
 }
 
 func (p *PacketPool) Acquire() *DirtyPacket {
-	pkt := <-p.free
+	var pkt *DirtyPacket
+	select {
+	case pkt = <-p.free:
+	default:
+		// Overflow — never block capture hot path.
+		pkt = &DirtyPacket{
+			Regions: make([]DirtyRegion, 0, p.maxRegions),
+			Payload: make([]byte, 0, p.payloadSize),
+			raw:     make([]byte, 0, 64+p.maxRegions*16+p.payloadSize),
+		}
+	}
+	if cap(pkt.Regions) < p.maxRegions {
+		pkt.Regions = make([]DirtyRegion, 0, p.maxRegions)
+	}
+	if cap(pkt.Payload) < p.payloadSize {
+		pkt.Payload = make([]byte, 0, p.payloadSize)
+	}
 	pkt.Regions = pkt.Regions[:0]
 	pkt.Payload = pkt.Payload[:0]
 	pkt.raw = pkt.raw[:0]

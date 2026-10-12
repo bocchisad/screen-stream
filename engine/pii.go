@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"sync"
+	"unicode"
 )
 
 // PatternDetector is the default on-device redaction helper.
@@ -31,9 +32,9 @@ func NewPatternDetector() *PatternDetector {
 }
 
 // Detect returns rects to black out. Prefer DetectInto on the hot path.
-func (d *PatternDetector) Detect(ctx context.Context, meta FrameMeta, protectedBGRA []byte) ([]Rect, error) {
+func (d *PatternDetector) Detect(ctx context.Context, meta FrameMeta, plaintextBGRA []byte) ([]Rect, error) {
 	_ = ctx
-	_ = protectedBGRA
+	_ = plaintextBGRA
 	_ = meta
 	out := d.DetectInto(nil)
 	return out, nil
@@ -60,17 +61,57 @@ func (d *PatternDetector) SetHits(rects []Rect) {
 }
 
 // ScanText maps matching pattern spans to block-aligned rects (helper for OCR/text layer).
+// Card-like digit runs must also pass Luhn.
 func (d *PatternDetector) ScanText(text string, lineRect Rect, blockSize uint16) []Rect {
 	if blockSize == 0 {
 		blockSize = 64
 	}
 	var hits []Rect
-	for _, re := range d.patterns {
-		if re.MatchString(text) {
+	for i, re := range d.patterns {
+		for _, m := range re.FindAllString(text, -1) {
+			if i == 1 && !luhnValid(digitsOnly(m)) {
+				continue
+			}
 			hits = append(hits, alignRect(lineRect, blockSize))
+			break // one hit per pattern family is enough for the line rect
 		}
 	}
 	return hits
+}
+
+func digitsOnly(s string) string {
+	b := make([]byte, 0, len(s))
+	for _, r := range s {
+		if unicode.IsDigit(r) {
+			b = append(b, byte(r))
+		}
+	}
+	return string(b)
+}
+
+// luhnValid implements the Luhn checksum for PAN-like digit strings.
+func luhnValid(digits string) bool {
+	n := len(digits)
+	if n < 13 || n > 19 {
+		return false
+	}
+	sum := 0
+	alt := false
+	for i := n - 1; i >= 0; i-- {
+		d := int(digits[i] - '0')
+		if d < 0 || d > 9 {
+			return false
+		}
+		if alt {
+			d *= 2
+			if d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		alt = !alt
+	}
+	return sum%10 == 0
 }
 
 func alignRect(r Rect, block uint16) Rect {
