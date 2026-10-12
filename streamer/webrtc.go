@@ -49,6 +49,11 @@ type WebRTCSession struct {
 	stunURL        string
 	disableAEAD    bool
 	onSessionReady func(uint64)
+	h264           bool
+	h264Sink       *H264Sink
+	onH264         func([]byte) // inbound Annex-B AU
+	trackReady     chan struct{}
+	trackOnce      sync.Once
 }
 
 type SessionConfig struct {
@@ -65,6 +70,11 @@ type SessionConfig struct {
 	// IdentityPriv/Pub are optional static X25519 keys for stable TOFU fingerprints.
 	IdentityPriv []byte
 	IdentityPub  []byte
+	// H264 enables WebRTC video track path (hardware encode on sender).
+	// DirtyPacket DataChannel is not used when H264 is true.
+	H264 bool
+	// OnH264AU is called with Annex-B access units on the answerer.
+	OnH264AU func([]byte)
 }
 
 func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
@@ -89,11 +99,14 @@ func NewWebRTCSession(cfg SessionConfig) *WebRTCSession {
 		disableAEAD:    cfg.DisableAEAD,
 		idPriv:         append([]byte(nil), cfg.IdentityPriv...),
 		idPub:          append([]byte(nil), cfg.IdentityPub...),
+		h264:           cfg.H264,
+		onH264:         cfg.OnH264AU,
 		packBuf:        make([]byte, 0, 8<<20),
 		chunkBuf:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
 		sendCopy:       make([]byte, ChunkHeaderSize+DefaultChunkSize),
 		aeadBuf:        make([]byte, 0, 8<<20),
 		dcOpen:         make(chan struct{}),
+		trackReady:     make(chan struct{}),
 	}
 	s.reasm = NewChunkReassemblerSize(func(full []byte) {
 		s.recv.Add(1)
@@ -184,11 +197,26 @@ func (s *WebRTCSession) applySessionKeys(aeadKey []byte, xorSeed uint64) error {
 }
 
 func (s *WebRTCSession) TryEnqueue(pkt *engine.DirtyPacket) { s.ring.TryEnqueue(pkt) }
-func (s *WebRTCSession) Sent() uint64                       { return s.sent.Load() }
-func (s *WebRTCSession) Recv() uint64                       { return s.recv.Load() }
-func (s *WebRTCSession) BytesSent() uint64                  { return s.bytesSent.Load() }
-func (s *WebRTCSession) BytesRecv() uint64                  { return s.bytesRecv.Load() }
-func (s *WebRTCSession) Dropped() uint64                    { return s.ring.Dropped() }
+func (s *WebRTCSession) Sent() uint64 {
+	if s.h264Sink != nil {
+		return s.h264Sink.Sent()
+	}
+	return s.sent.Load()
+}
+func (s *WebRTCSession) Recv() uint64 { return s.recv.Load() }
+func (s *WebRTCSession) BytesSent() uint64 {
+	if s.h264Sink != nil {
+		return s.h264Sink.BytesSent()
+	}
+	return s.bytesSent.Load()
+}
+func (s *WebRTCSession) BytesRecv() uint64 { return s.bytesRecv.Load() }
+func (s *WebRTCSession) Dropped() uint64 {
+	if s.h264Sink != nil {
+		return s.h264Sink.Dropped()
+	}
+	return s.ring.Dropped()
+}
 
 // PeerConfig builds pion ICE config. Empty stunURL → host candidates only.
 func PeerConfig(stunURL string) webrtc.Configuration {
@@ -200,10 +228,15 @@ func PeerConfig(stunURL string) webrtc.Configuration {
 }
 
 func newPeerConnection(stunURL string) (*webrtc.PeerConnection, error) {
-	se := webrtc.SettingEngine{}
-	se.SetSCTPMaxMessageSize(16 << 20)
-	api := webrtc.NewAPI(webrtc.WithSettingEngine(se))
-	return api.NewPeerConnection(PeerConfig(stunURL))
+	return newPeerConnectionMedia(stunURL, false)
+}
+
+func (s *WebRTCSession) H264Sink() *H264Sink { return s.h264Sink }
+
+func (s *WebRTCSession) WriteH264(au engine.EncodedFrame) {
+	if s.h264Sink != nil {
+		s.h264Sink.TryEnqueueAU(au)
+	}
 }
 
 func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
@@ -214,19 +247,32 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	}
 	s.kxPriv = priv
 
-	pc, err := newPeerConnection(s.stunURL)
+	pc, err := newPeerConnectionMedia(s.stunURL, s.h264)
 	if err != nil {
 		return err
 	}
 	s.pc = pc
 
-	ordered := true
-	dc, err := pc.CreateDataChannel(s.label, &webrtc.DataChannelInit{Ordered: &ordered})
-	if err != nil {
-		_ = pc.Close()
-		return err
+	if s.h264 {
+		track, err := newH264Track()
+		if err != nil {
+			_ = pc.Close()
+			return err
+		}
+		if _, err := pc.AddTrack(track); err != nil {
+			_ = pc.Close()
+			return err
+		}
+		s.h264Sink = &H264Sink{track: track}
+	} else {
+		ordered := true
+		dc, err := pc.CreateDataChannel(s.label, &webrtc.DataChannelInit{Ordered: &ordered})
+		if err != nil {
+			_ = pc.Close()
+			return err
+		}
+		s.attachDC(dc)
 	}
-	s.attachDC(dc)
 	s.wireICE(ctx, sig, true)
 
 	offer, err := pc.CreateOffer(nil)
@@ -255,6 +301,9 @@ func (s *WebRTCSession) DialOfferer(ctx context.Context, sig Signaling) error {
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: ans.SDP}); err != nil {
 		return err
 	}
+	if s.h264 {
+		return s.waitICEConnected(ctx)
+	}
 	return s.waitDC(ctx)
 }
 
@@ -266,14 +315,30 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	}
 	s.kxPriv = priv
 
-	pc, err := newPeerConnection(s.stunURL)
+	pc, err := newPeerConnectionMedia(s.stunURL, s.h264)
 	if err != nil {
 		return err
 	}
 	s.pc = pc
-	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		s.attachDC(dc)
-	})
+	if s.h264 {
+		pc.OnTrack(func(track *webrtc.TrackRemote, recv *webrtc.RTPReceiver) {
+			_ = recv
+			s.trackOnce.Do(func() { close(s.trackReady) })
+			go func() {
+				_ = ReadRemoteH264(context.Background(), track, func(au []byte) {
+					s.recv.Add(1)
+					s.bytesRecv.Add(uint64(len(au)))
+					if s.onH264 != nil {
+						s.onH264(au)
+					}
+				})
+			}()
+		})
+	} else {
+		pc.OnDataChannel(func(dc *webrtc.DataChannel) {
+			s.attachDC(dc)
+		})
+	}
 	s.wireICE(ctx, sig, false)
 
 	off, err := sig.RecvOffer(ctx)
@@ -301,7 +366,47 @@ func (s *WebRTCSession) DialAnswerer(ctx context.Context, sig Signaling) error {
 	if err := sig.SendAnswer(s.sessionDesc(pc.LocalDescription().SDP, pub)); err != nil {
 		return err
 	}
+	if s.h264 {
+		// Don't wait for first RTP (would deadlock loopback before encode starts).
+		return s.waitICEConnected(ctx)
+	}
 	return s.waitDC(ctx)
+}
+
+func (s *WebRTCSession) waitICEConnected(ctx context.Context) error {
+	connected := make(chan struct{})
+	var once sync.Once
+	s.pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
+		if st == webrtc.PeerConnectionStateConnected {
+			once.Do(func() { close(connected) })
+		}
+	})
+	if s.pc.ConnectionState() == webrtc.PeerConnectionStateConnected {
+		return nil
+	}
+	timer := time.NewTimer(45 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-connected:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("ICE connected timeout (H264)")
+	}
+}
+
+func (s *WebRTCSession) waitTrack(ctx context.Context) error {
+	timer := time.NewTimer(45 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.trackReady:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("remote H264 track timeout")
+	}
 }
 
 func (s *WebRTCSession) wireICE(ctx context.Context, sig Signaling, offerer bool) {
@@ -385,6 +490,10 @@ func (s *WebRTCSession) Start(ctx context.Context) error {
 }
 
 func (s *WebRTCSession) StartSendLoop(ctx context.Context) error {
+	if s.h264 {
+		// H.264 frames are pushed via WriteH264; no DirtyPacket ring drain.
+		return nil
+	}
 	ctx, s.cancel = context.WithCancel(ctx)
 	s.wg.Add(1)
 	go func() {
@@ -460,6 +569,9 @@ func (s *WebRTCSession) Stop() error {
 	}
 	if s.dc != nil {
 		_ = s.dc.Close()
+	}
+	if s.h264Sink != nil {
+		s.h264Sink.Close()
 	}
 	pc := s.pc
 	s.mu.Unlock()

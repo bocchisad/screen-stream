@@ -34,6 +34,7 @@ go run ./cmd/screen-stream -mode=send -signal=127.0.0.1:8787 \
 **Flags:**
 - `-mode=cli` — interactive terminal menu (bubbletea TUI)
 - `-capture=cpu|gpu-surface` — staging path (`gpu-surface` = retain surface/buffer, one copy into Go; still SCK/PipeWire, experimental)
+- `-codec=dirty|h264` — `dirty` = DataChannel DirtyPacket (default); `h264` = **hardware** H.264 WebRTC track (SRTP; no software fallback): VideoToolbox (macOS), VAAPI EncSlice (Linux), MediaFoundation HW MFT (Windows)
 - `-stun=stun:host:port` — optional ICE STUN (no TURN/SFU)
 - `-peer` / `-peers` — hub slot(s) for multi-viewer
 - `-tofu=auto|off` — pin identity fingerprint (default `auto`); `-tofu-file`, `-identity`

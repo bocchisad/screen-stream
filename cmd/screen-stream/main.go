@@ -47,6 +47,7 @@ func main() {
 	peerFlag := flag.String("peer", "default", "hub peer slot name (recv / single send)")
 	peersFlag := flag.String("peers", "", "send fanout: comma-separated peer names (overrides -peer)")
 	captureFlag := flag.String("capture", "cpu", "capture staging: cpu | gpu-surface (experimental)")
+	codecFlag := flag.String("codec", "dirty", "wire codec: dirty (DataChannel tiles) | h264 (HW track: VT/VAAPI/MF)")
 	// legacy alias
 	webrtcAlias := flag.Bool("webrtc", false, "alias for -mode=loopback")
 	flag.Parse()
@@ -62,6 +63,27 @@ func main() {
 	}
 	if captureMode == engine.CaptureGPUSurface {
 		fmt.Fprintln(os.Stderr, "WARN: -capture=gpu-surface is EXPERIMENTAL — still ScreenCaptureKit/PipeWire (same OS visibility); at your own risk")
+	}
+	videoCodec, err := engine.ParseVideoCodec(*codecFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if videoCodec == engine.CodecH264 {
+		switch *mode {
+		case "bench", "hub", "doctor", "cli":
+			if *mode == "bench" {
+				fmt.Fprintln(os.Stderr, "h264: use -mode=send|recv|loopback (not bench)")
+				os.Exit(1)
+			}
+		case "send", "loopback":
+			if !engine.HardwareEncoderAvailable() {
+				fmt.Fprintf(os.Stderr, "h264 encode: %v — need platform HW encoder (VideoToolbox/VAAPI/MediaFoundation; no software fallback)\n", engine.ErrNotSupported)
+				os.Exit(1)
+			}
+		case "recv":
+			// decoder opened later; still HW-only on darwin
+		}
 	}
 
 	seed := engine.DefaultXORSeed
@@ -114,8 +136,8 @@ func main() {
 		}
 	}
 
-	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  capture=%v  ecdh=x25519  aead=chacha20poly1305  auth=%v\n",
-		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, captureMode, token != "")
+	fmt.Printf("screen-stream  go=%s  os=%s/%s  mode=%s  capture=%v  codec=%s  ecdh=x25519  aead=chacha20poly1305  auth=%v\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, *mode, captureMode, videoCodec, token != "")
 
 	tofuMode := strings.ToLower(strings.TrimSpace(*tofuFlag))
 	if tofuMode != "auto" && tofuMode != "off" {
@@ -127,7 +149,7 @@ func main() {
 		synthetic: *synthetic, pii: *pii, ocr: *ocr, compress: *compress,
 		scale: *scale, maxW: *maxW, maxH: *maxH, exclude: *exclude, excludeWin: *excludeWin,
 		seed: seed, token: token, stun: *stunFlag, expectFP: *expectFP, captureMode: captureMode,
-		tofu: tofuMode, tofuFile: *tofuFile, identityPath: *identityFlag,
+		tofu: tofuMode, tofuFile: *tofuFile, identityPath: *identityFlag, codec: videoCodec,
 	}
 
 	switch *mode {
@@ -212,6 +234,7 @@ func runDoctor(signalAddr, token string) {
 	if tofuPath, err := streamer.DefaultTOFUPath(); err == nil {
 		fmt.Printf("  tofu_path=%s  (-tofu=auto pins identity fingerprint)\n", tofuPath)
 	}
+	fmt.Printf("  h264_hw_encoder=%v  (-codec=h264)\n", engine.HardwareEncoderAvailable())
 
 	g := engine.NewGrabber()
 	fmt.Printf("  grabber backend=%s\n", g.Backend())
@@ -290,6 +313,7 @@ type sessionOpts struct {
 	peer                    string
 	peers                   []string
 	captureMode             engine.CaptureMode
+	codec                   engine.VideoCodec
 	transport               string // local | loopback | send | recv
 	signalURL               string
 }
@@ -377,12 +401,13 @@ func runSession(o sessionOpts) {
 	defer cancel()
 
 	var (
-		sink        streamer.Sink
-		recvCount   atomic.Uint64
-		reconFrames atomic.Uint64
-		rec         *streamer.FrameReconstructor
-		rtc         *streamer.WebRTCSession
-		rtcPeer     *streamer.WebRTCSession
+		sink         streamer.Sink
+		recvCount    atomic.Uint64
+		reconFrames  atomic.Uint64
+		rec          *streamer.FrameReconstructor
+		rtc          *streamer.WebRTCSession
+		rtcPeer      *streamer.WebRTCSession
+		h264Sessions []*streamer.WebRTCSession
 	)
 
 	switch o.transport {
@@ -401,19 +426,43 @@ func runSession(o sessionOpts) {
 		var lastPrev time.Time
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 45*time.Second)
 		var err error
+		useH264 := o.codec == engine.CodecH264
+		var h264Dec engine.VideoDecoder
+		if useH264 {
+			h264Dec = engine.NewHardwareDecoder()
+			if err := h264Dec.Open(3840, 2160); err != nil {
+				fmt.Fprintf(os.Stderr, "h264 decode: %v\n", err)
+				os.Exit(1)
+			}
+			defer h264Dec.Close()
+		}
 		rtc, rtcPeer, err = streamer.ConnectLoopbackOpts(dialCtx, streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
 			STUNURL:   o.stun,
+			H264:      useH264,
 			OnSessionReady: func(seed uint64) {
 				o.seed = seed
-				rec.SetSeed(seed)
+				if rec != nil {
+					rec.SetSeed(seed)
+				}
 			},
 			OnPacket: func(b []byte) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
 					reconFrames.Add(1)
 					maybePreview(prev, rec, &lastPrev)
+				}
+			},
+			OnH264AU: func(au []byte) {
+				recvCount.Add(1)
+				bgra, w, h, stride, err := h264Dec.Decode(context.Background(), au)
+				if err != nil || bgra == nil {
+					return
+				}
+				reconFrames.Add(1)
+				if prev != nil {
+					_ = prev.UpdateFromBGRA(bgra, w, h, stride)
 				}
 			},
 		})
@@ -428,13 +477,15 @@ func runSession(o sessionOpts) {
 		defer rtc.Stop()
 		defer rtcPeer.Stop()
 		sink = rtc
-		fmt.Printf("webrtc: loopback (compress=%v ecdh_seed=0x%X fingerprint=%s)\n", o.compress, o.seed, fp)
+		h264Sessions = []*streamer.WebRTCSession{rtc}
+		fmt.Printf("webrtc: loopback codec=%s (compress=%v ecdh_seed=0x%X fingerprint=%s)\n", o.codec, o.compress, o.seed, fp)
 
 	case "send":
 		peers := o.peers
 		if len(peers) == 0 {
 			peers = []string{"default"}
 		}
+		useH264 := o.codec == engine.CodecH264
 		sessions := make([]*streamer.WebRTCSession, 0, len(peers))
 		var metricsCLI *streamer.HTTPSignalingClient
 		dialCtx, dialCancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -444,7 +495,7 @@ func runSession(o sessionOpts) {
 				metricsCLI = sig
 			}
 			s := streamer.NewWebRTCSession(o.withIdentity(streamer.SessionConfig{
-				RingDepth: 4, Compress: o.compress, STUNURL: o.stun,
+				RingDepth: 4, Compress: o.compress, STUNURL: o.stun, H264: useH264,
 			}))
 			if err := s.DialOfferer(dialCtx, sig); err != nil {
 				dialCancel()
@@ -455,7 +506,7 @@ func runSession(o sessionOpts) {
 			enforceFingerprint(o, o.signalURL, peer, fp)
 			_ = s.StartSendLoop(context.Background())
 			sessions = append(sessions, s)
-			fmt.Printf("webrtc: send peer=%s fingerprint=%s ecdh_seed=0x%X\n", peer, fp, s.SessionSeed())
+			fmt.Printf("webrtc: send peer=%s codec=%s fingerprint=%s ecdh_seed=0x%X\n", peer, o.codec, fp, s.SessionSeed())
 		}
 		dialCancel()
 		o.seed = sessions[0].SessionSeed()
@@ -465,13 +516,14 @@ func runSession(o sessionOpts) {
 				_ = s.Stop()
 			}
 		}()
+		h264Sessions = sessions
 		if len(sessions) == 1 {
 			sink = sessions[0]
 		} else {
 			sink = streamer.NewFanoutSink(sessions...)
 		}
 		startMetricsPusher(ctx, metricsCLI, sessions...)
-		fmt.Printf("webrtc: send → %s peers=%v\n", o.signalURL, peers)
+		fmt.Printf("webrtc: send → %s peers=%v codec=%s\n", o.signalURL, peers, o.codec)
 
 	case "recv":
 		rec = streamer.NewFrameReconstructor(1)
@@ -484,20 +536,44 @@ func runSession(o sessionOpts) {
 		if peer == "" {
 			peer = "default"
 		}
+		useH264 := o.codec == engine.CodecH264
+		var h264Dec engine.VideoDecoder
+		if useH264 {
+			h264Dec = engine.NewHardwareDecoder()
+			if err := h264Dec.Open(3840, 2160); err != nil {
+				fmt.Fprintf(os.Stderr, "h264 decode: %v\n", err)
+				os.Exit(1)
+			}
+			defer h264Dec.Close()
+		}
 		sig := streamer.NewHTTPSignalingClientPeer(o.signalURL, o.token, peer)
 		rtc = streamer.NewWebRTCSession(o.withIdentity(streamer.SessionConfig{
 			RingDepth: 4,
 			Compress:  o.compress,
 			STUNURL:   o.stun,
+			H264:      useH264,
 			OnSessionReady: func(seed uint64) {
 				o.seed = seed
-				rec.SetSeed(seed)
+				if rec != nil {
+					rec.SetSeed(seed)
+				}
 			},
 			OnPacket: func(b []byte) {
 				recvCount.Add(1)
 				if err := rec.Apply(b); err == nil {
 					reconFrames.Add(1)
 					maybePreview(prev, rec, &lastPrev)
+				}
+			},
+			OnH264AU: func(au []byte) {
+				recvCount.Add(1)
+				bgra, w, h, stride, err := h264Dec.Decode(context.Background(), au)
+				if err != nil || bgra == nil {
+					return
+				}
+				reconFrames.Add(1)
+				if prev != nil {
+					_ = prev.UpdateFromBGRA(bgra, w, h, stride)
 				}
 			},
 		}))
@@ -514,7 +590,7 @@ func runSession(o sessionOpts) {
 		enforceFingerprint(o, o.signalURL, peer, fp)
 		defer rtc.Stop()
 		startMetricsPusher(ctx, sig, rtc)
-		fmt.Printf("webrtc: recv ← %s peer=%s ecdh_seed=0x%X fingerprint=%s\n", o.signalURL, peer, o.seed, fp)
+		fmt.Printf("webrtc: recv ← %s peer=%s codec=%s ecdh_seed=0x%X fingerprint=%s\n", o.signalURL, peer, o.codec, o.seed, fp)
 		<-ctx.Done()
 		time.Sleep(200 * time.Millisecond)
 		fmt.Printf("webrtc_recv=%d  reconstructed=%d\n", recvCount.Load(), reconFrames.Load())
@@ -606,27 +682,7 @@ func runSession(o sessionOpts) {
 		}
 	}
 
-	pipe := engine.NewPipeline(engine.PipelineConfig{
-		Width: w, Height: h, Stride: stride, BlockSize: block,
-		Detector: detector, XORSeed: o.seed,
-	})
-	defer pipe.Close()
-
 	pool := engine.NewBufferPool(stride * h)
-	var fr engine.Frame
-	warm := pool.Acquire()
-	for i := 0; i < 5; i++ {
-		m, err := grabber.Capture(ctx, warm)
-		if err != nil {
-			break
-		}
-		fr = engine.Frame{Meta: m, Pixels: warm}
-		if pkt, err := pipe.Process(ctx, &fr); err == nil {
-			sink.TryEnqueue(pkt)
-		}
-	}
-	pool.Release(warm)
-
 	samples := make([]time.Duration, 0, int(o.seconds*float64(o.fps))+16)
 	var frames int
 	var memBefore, memAfter runtime.MemStats
@@ -635,35 +691,106 @@ func runSession(o sessionOpts) {
 	buf := pool.Acquire()
 	defer pool.Release(buf)
 
-loop:
-	for {
-		select {
-		case <-ctx.Done():
-			break loop
-		default:
+	if o.codec == engine.CodecH264 {
+		enc := engine.NewHardwareEncoder()
+		if err := enc.Open(engine.EncoderConfig{
+			Width: w, Height: h, FPS: o.fps,
+			Bitrate: engine.DefaultH264Bitrate(w, h, o.fps),
+			KeyframeEvery: o.fps * 2,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "h264 encode open: %v\n", err)
+			os.Exit(1)
 		}
-		m, err := grabber.Capture(ctx, buf)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		defer enc.Close()
+		fmt.Printf("encoder=%s bitrate≈%d\n", enc.Backend(), engine.DefaultH264Bitrate(w, h, o.fps))
+
+	loopH264:
+		for {
+			select {
+			case <-ctx.Done():
+				break loopH264
+			default:
+			}
+			m, err := grabber.Capture(ctx, buf)
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					break
+				}
+				if errors.Is(err, engine.ErrBackendUnavailable) {
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "capture: %v\n", err)
 				break
 			}
-			if errors.Is(err, engine.ErrBackendUnavailable) {
-				continue
+			if detector != nil {
+				_ = engine.RedactBGRA(ctx, detector, m, buf, stride)
 			}
-			fmt.Fprintf(os.Stderr, "capture: %v\n", err)
-			break
+			t0 := time.Now()
+			aus, err := enc.Encode(ctx, buf, stride, m.PTS)
+			dt := time.Since(t0)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "h264 encode: %v\n", err)
+				break
+			}
+			for _, au := range aus {
+				for _, s := range h264Sessions {
+					s.WriteH264(au)
+				}
+			}
+			samples = append(samples, dt)
+			frames++
 		}
-		fr = engine.Frame{Meta: m, Pixels: buf}
-		t0 := time.Now()
-		pkt, err := pipe.Process(ctx, &fr)
-		dt := time.Since(t0)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "pipeline: %v\n", err)
-			break
+	} else {
+		pipe := engine.NewPipeline(engine.PipelineConfig{
+			Width: w, Height: h, Stride: stride, BlockSize: block,
+			Detector: detector, XORSeed: o.seed,
+		})
+		defer pipe.Close()
+
+		var fr engine.Frame
+		warm := pool.Acquire()
+		for i := 0; i < 5; i++ {
+			m, err := grabber.Capture(ctx, warm)
+			if err != nil {
+				break
+			}
+			fr = engine.Frame{Meta: m, Pixels: warm}
+			if pkt, err := pipe.Process(ctx, &fr); err == nil {
+				sink.TryEnqueue(pkt)
+			}
 		}
-		sink.TryEnqueue(pkt)
-		samples = append(samples, dt)
-		frames++
+		pool.Release(warm)
+
+	loopDirty:
+		for {
+			select {
+			case <-ctx.Done():
+				break loopDirty
+			default:
+			}
+			m, err := grabber.Capture(ctx, buf)
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+					break
+				}
+				if errors.Is(err, engine.ErrBackendUnavailable) {
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "capture: %v\n", err)
+				break
+			}
+			fr = engine.Frame{Meta: m, Pixels: buf}
+			t0 := time.Now()
+			pkt, err := pipe.Process(ctx, &fr)
+			dt := time.Since(t0)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pipeline: %v\n", err)
+				break
+			}
+			sink.TryEnqueue(pkt)
+			samples = append(samples, dt)
+			frames++
+		}
 	}
 
 	time.Sleep(200 * time.Millisecond)
